@@ -140,9 +140,11 @@
         <body class="vscode-body vscode-light">
             <h1 id="windows-can-utils">Windows CAN Utils</h1>
 <p>Provides CLI tools for interacting with Cyder CAN modules over serial. We currently target the <a href="https://www.deshide.com/product-details_SH-C30A.html">DSD TECH SH-C30A</a> USB to CAN adapter on Windows devices.</p>
+<h2 id="table-of-contents">Table of Contents</h2>
 <ul>
 <li><a href="#windows-can-utils">Windows CAN Utils</a>
 <ul>
+<li><a href="#table-of-contents">Table of Contents</a></li>
 <li><a href="#installation">Installation</a></li>
 <li><a href="#usage">Usage</a>
 <ul>
@@ -169,19 +171,20 @@
 <p>Opens a serial line CAN connection to an slcan adapter and exposes it via Windows <a href="https://learn.microsoft.com/en-us/windows/win32/ipc/pipes">pipe</a>.<br>
 To find the adapter, open 'Device Manager' and look in the 'Ports (COM &amp; LPT)' dropdown.</p>
 <pre><code>Usage: can_send &lt;port&gt; [--bitrate &lt;ID#DATA&gt;]
-can_server COM5 --bitrate 1000000
+Example: can_server COM5 --bitrate 1000000
 </code></pre>
 <h3 id="can-dump">CAN Dump</h3>
 <p>Prints realtime CAN data from an open CAN pipe to standard output.</p>
-<pre><code>can_dump COM5
+<pre><code>Usage: can_dump &lt;port&gt;
+Example: can_dump COM5
 </code></pre>
-<p>NOTE: A CAN server instance <strong>must</strong> be open for the target device.</p>
+<p>NOTE: A CAN server instance <strong>must</strong> be open for the target port.</p>
 <h3 id="can-send">CAN Send</h3>
 <p>Sends the given CAN frame to an open CAN pipe.</p>
 <pre><code>Usage: can_send &lt;port&gt; &lt;ID#DATA&gt;
-can_send COM5 055#00
+Example: can_send COM5 055#00
 </code></pre>
-<p>NOTE: A CAN server instance <strong>must</strong> be open for the target device.</p>
+<p>NOTE: A CAN server instance <strong>must</strong> be open for the target port.</p>
 <h2 id="developers">Developers</h2>
 <h3 id="install-from-source-files-using-cargo">Install from source files (Using Cargo)</h3>
 <pre><code>cd win_can_utils

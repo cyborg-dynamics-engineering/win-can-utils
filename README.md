@@ -2,7 +2,9 @@
 
 Provides CLI tools for interacting with Cyder CAN modules over serial. We currently target the [DSD TECH SH-C30A](https://www.deshide.com/product-details_SH-C30A.html) USB to CAN adapter on Windows devices.
 
+## Table of Contents
 - [Windows CAN Utils](#windows-can-utils)
+  - [Table of Contents](#table-of-contents)
   - [Installation](#installation)
   - [Usage](#usage)
     - [CAN Server](#can-server)
