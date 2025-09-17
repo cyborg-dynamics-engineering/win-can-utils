@@ -11,9 +11,9 @@ This project aims to provide a Windows equivalent of [can-utils](https://github.
     - [CAN Dump](#can-dump)
     - [CAN Send](#can-send)
   - [slcan firmware installation](#slcan-firmware-installation)
-- [License](#license)
-- [Developers](#developers)
-  - [Contribution](#contribution)
+  - [License](#license)
+  - [Developers](#developers)
+    - [Contribution](#contribution)
     - [Install from source files (Using Cargo)](#install-from-source-files-using-cargo)
     - [Generating MSI Installer](#generating-msi-installer)
 
@@ -65,7 +65,7 @@ To flash the device, perform the following steps:
 9. Unplug and re-insert the adapter into the PC.
 10. Attempt to open a can_server using the device to determine whether flashing was successful.
 
-# License
+## License
 Windows CAN Utils is licensed under either of
 
     Apache License, Version 2.0 (LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0)
@@ -73,9 +73,9 @@ Windows CAN Utils is licensed under either of
 
 at your option.
 
-# Developers
+## Developers
 
-## Contribution
+### Contribution
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
 
 ### Install from source files (Using Cargo)
