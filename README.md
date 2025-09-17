@@ -11,11 +11,11 @@ This project aims to provide a Windows equivalent of [can-utils](https://github.
     - [CAN Dump](#can-dump)
     - [CAN Send](#can-send)
   - [slcan firmware installation](#slcan-firmware-installation)
-  - [Developers](#developers)
+- [License](#license)
+- [Developers](#developers)
+  - [Contribution](#contribution)
     - [Install from source files (Using Cargo)](#install-from-source-files-using-cargo)
     - [Generating MSI Installer](#generating-msi-installer)
-  - [License](#license)
-  - [Contribution](#contribution)
 
 
 ## Installation
