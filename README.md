@@ -63,7 +63,7 @@ To flash the device, perform the following steps:
 7. Wait for the flash to complete. An error message may appear, but can be ignored.
 8. Put the boot switch into the 'Off' position.
 9. Unplug and re-insert the adapter into the PC.
-10. Attempt to open a can_server using the device to determine whether flashing has worked.
+10. Attempt to open a can_server using the device to determine whether flashing was successful.
 
 ## Developers
 
