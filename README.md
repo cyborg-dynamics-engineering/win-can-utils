@@ -2,8 +2,10 @@
 
 Provides CLI tools for interacting with Cyder CAN modules over serial. We currently target the [DSD TECH SH-C30A](https://www.deshide.com/product-details_SH-C30A.html) USB to CAN adapter on Windows devices.
 
+## Install using MSI Installer
+Download & run the latest .msi installer from [Releases](https://github.com/Cyborg-Dynamics-Engineering/win-can-utils/releases)
 
-## Install
+## Install from source files (Using Cargo)
 ```
 cd win_can_utils
 cargo install --path .
