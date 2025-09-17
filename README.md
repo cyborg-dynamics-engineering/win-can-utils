@@ -65,7 +65,18 @@ To flash the device, perform the following steps:
 9. Unplug and re-insert the adapter into the PC.
 10. Attempt to open a can_server using the device to determine whether flashing was successful.
 
-## Developers
+# License
+Windows CAN Utils is licensed under either of
+
+    Apache License, Version 2.0 (LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0)
+    MIT license (LICENSE-MIT or http://opensource.org/licenses/MIT)
+
+at your option.
+
+# Developers
+
+## Contribution
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
 
 ### Install from source files (Using Cargo)
 ```
@@ -87,15 +98,3 @@ Generate MSI file:
 ```
 cargo wix
 ```
-
-## License
-Windows CAN Utils is licensed under either of
-
-    Apache License, Version 2.0 (LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0)
-    MIT license (LICENSE-MIT or http://opensource.org/licenses/MIT)
-
-at your option.
-
-
-## Contribution
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
