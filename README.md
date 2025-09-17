@@ -53,11 +53,15 @@ SH-C30A and SH-C31A may not ship with slcan firmware. The stock CANable slcan fi
 
 To flash the device, perform the following steps:
 1. Unplug the adapter from your computer.
-2. Switch the boot toggle into the 'down' position as pictured.
-3. Plug the adapter into your computer.
-4. Open the canable updater page and select 'Connect and Update'.
-5. Choose the CAN adapter from the list. It should appear as 'DFU in FS Mode - Paired'.
-6. Wait for the flash to complete. An error message may appear, but can be ignored.
+2. Put the boot switch into the 'On' position as pictured.
+<img src="https://github.com/user-attachments/assets/154c4837-61d0-402f-9a38-76f50d5a5f81" width="200">
+4. Plug the adapter into your computer.
+5. Open the canable updater page and select 'Connect and Update'.
+6. Choose the CAN adapter from the list. It should appear as 'DFU in FS Mode - Paired'.
+7. Wait for the flash to complete. An error message may appear, but can be ignored.
+8. Put the boot switch into the 'Off' position.
+9. Unplug and re-insert the adapter into the PC.
+10. Attempt to open a can_server using the device to determine whether flashing has worked.
 
 ## Developers
 
