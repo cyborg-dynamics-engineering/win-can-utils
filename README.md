@@ -9,6 +9,20 @@ cd win_can_utils
 cargo install --path .
 ```
 
+## Generating MSI Installer
+To install cargo wix:
+```
+cargo install cargo-wix
+```
+
+Download the WiX3 binaries zip - [WiX3 toolset](https://github.com/wixtoolset/wix3/releases)
+Extract it somewhere on your PC. ie: C:\Program Files\WiX Toolset v4.0\bin\
+Add the directory containing the binaries to PATH in Environment Variables.
+
+Generate MSI file:
+```
+cargo wix
+```
 
 ## CAN Server
 Opens a serial line CAN connection to a given COM port and exposes it to a Windows [pipe](https://learn.microsoft.com/en-us/windows/win32/ipc/pipes).
