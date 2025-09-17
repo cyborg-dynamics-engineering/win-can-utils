@@ -17,7 +17,7 @@ To install cargo wix:
 cargo install cargo-wix
 ```
 
-Download the WiX3 binaries zip - [WiX3 toolset](https://github.com/wixtoolset/wix3/releases)<br>
+Download the WiX3 binaries .zip - https://github.com/wixtoolset/wix3/releases
 Extract it somewhere on your PC. ie: C:\Program Files\WiX Toolset v4.0\bin\
 Add the directory containing the binaries to PATH in Environment Variables.
 
