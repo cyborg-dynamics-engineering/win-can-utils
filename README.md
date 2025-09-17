@@ -2,16 +2,56 @@
 
 Provides CLI tools for interacting with Cyder CAN modules over serial. We currently target the [DSD TECH SH-C30A](https://www.deshide.com/product-details_SH-C30A.html) USB to CAN adapter on Windows devices.
 
-## Install using MSI Installer
+- [Windows CAN Utils](#windows-can-utils)
+  - [Installation](#installation)
+  - [Usage](#usage)
+    - [CAN Server](#can-server)
+    - [CAN Dump](#can-dump)
+    - [CAN Send](#can-send)
+  - [Developers](#developers)
+    - [Install from source files (Using Cargo)](#install-from-source-files-using-cargo)
+    - [Generating MSI Installer](#generating-msi-installer)
+  - [License](#license)
+  - [Contribution](#contribution)
+
+
+## Installation
 Download & run the latest .msi installer from [Releases](https://github.com/Cyborg-Dynamics-Engineering/win-can-utils/releases)
 
-## Install from source files (Using Cargo)
+## Usage
+### CAN Server
+Opens a serial line CAN connection to an slcan adapter and exposes it via Windows [pipe](https://learn.microsoft.com/en-us/windows/win32/ipc/pipes).<br>
+To find the adapter, open 'Device Manager' and look in the 'Ports (COM & LPT)' dropdown.
+```
+Usage: can_send <port> [--bitrate <ID#DATA>]
+Example: can_server COM5 --bitrate 1000000
+```
+
+### CAN Dump
+Prints realtime CAN data from an open CAN pipe to standard output.
+```
+Usage: can_dump <port>
+Example: can_dump COM5
+```
+NOTE: A CAN server instance **must** be open for the target port.
+
+### CAN Send
+Sends the given CAN frame to an open CAN pipe.
+```
+Usage: can_send <port> <ID#DATA>
+Example: can_send COM5 055#00
+```
+NOTE: A CAN server instance **must** be open for the target port.
+
+## Developers
+
+### Install from source files (Using Cargo)
 ```
 cd win_can_utils
 cargo install --path .
 ```
 
-## Generating MSI Installer
+### Generating MSI Installer
 To install cargo wix:
 ```
 cargo install cargo-wix
@@ -24,34 +64,6 @@ Add the directory containing the binaries to PATH in Environment Variables.
 Generate MSI file:
 ```
 cargo wix
-```
-
-## CAN Server
-Opens a serial line CAN connection to a given COM port and exposes it to a Windows [pipe](https://learn.microsoft.com/en-us/windows/win32/ipc/pipes).
-```
-can_server COM5
-```
-
-A bitrate can be optionally set. If not provided, the server will attempt to measure the existing bitrate on the bus.
-```
-can_server COM3 1000000
-```
-
-
-## CAN Dump
-Prints realtime CAN data from an open CAN pipe to standard output.
-```
-can_dump COM5
-```
-
-
-## CAN Send
-Sends the given CAN frame to an open CAN pipe.
-
-## Usage
-The COM port must be specified to the executable, followed by the CAN frame in the format: ID#DATA
-```
-can_send COM5 055#00
 ```
 
 ## License
