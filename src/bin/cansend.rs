@@ -1,6 +1,5 @@
 use clap::Parser;
-use crosscan::can::CanFrame;
-use crosscan::win_can::CanSocket;
+use crosscan::{CanInterface, can::CanFrame, win_can::WindowsCan};
 use std::io;
 use std::process;
 use tokio::time::{Duration, sleep};
@@ -40,12 +39,12 @@ async fn main() -> io::Result<()> {
     pipe.write_frame(frame).await
 }
 
-async fn connect_pipe_retry(channel: &str, max_attempts: i32) -> Option<CanSocket> {
+async fn connect_pipe_retry(channel: &str, max_attempts: i32) -> Option<WindowsCan> {
     println!("Attempting to connect to {} server", channel);
 
     let mut attempts = 0;
     loop {
-        match CanSocket::open_write_only(channel) {
+        match WindowsCan::open_write_only(channel) {
             Ok(pipe) => {
                 println!("Connected to {} server", channel);
                 return Some(pipe);
