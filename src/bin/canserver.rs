@@ -92,10 +92,11 @@ async fn main() -> std::io::Result<()> {
     let driver = match cli.driver.to_lowercase().as_str() {
         "slcan" => init_slcan(&cli).await,
         _ => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Failed to start slcan driver.",
-            ));
+            eprintln!(
+                "Did not recognize driver specified: {}\nSupported drivers are: slcan",
+                cli.driver
+            );
+            exit(1);
         }
     };
 
@@ -103,7 +104,7 @@ async fn main() -> std::io::Result<()> {
     let driver = match driver {
         Ok(driver) => Arc::new(Mutex::new(driver)),
         Err(e) => {
-            eprintln!("{}", e);
+            eprintln!("{}", e.to_string());
             exit(1);
         }
     };
