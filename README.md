@@ -26,8 +26,8 @@ Download & run the latest .msi installer from [Releases](https://github.com/Cybo
 Opens a serial line CAN connection to an slcan adapter and exposes it via Windows [pipe](https://learn.microsoft.com/en-us/windows/win32/ipc/pipes).<br>
 To find the adapter, open 'Device Manager' and look in the 'Ports (COM & LPT)' dropdown.
 ```
-Usage: canserver <port> [--bitrate <bitrate>]
-Example: canserver COM5 --bitrate 1000000
+Usage: canserver <driver> <port> [--bitrate <bitrate>]
+Example: canserver slcan COM5 --bitrate 1000000
 ```
 
 ### CAN Dump
