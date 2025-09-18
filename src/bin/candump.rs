@@ -194,13 +194,13 @@ pub enum Filter {
     Join,
 }
 
-pub struct InterfaceSpec {
+pub struct CandumpInterface {
     pub ifname: String,
     pub filters: Vec<Filter>,
     pub pipe: CanSocket,
 }
 
-impl InterfaceSpec {
+impl CandumpInterface {
     pub async fn parse_and_connect(spec: &str) -> Result<Self, String> {
         // format: ifname[,filter]*
         let mut parts = spec.split(',');
@@ -252,7 +252,7 @@ impl InterfaceSpec {
 
         let pipe = connect_pipe_retry(ifname.as_str()).await;
 
-        Ok(InterfaceSpec {
+        Ok(CandumpInterface {
             ifname,
             filters,
             pipe,
@@ -296,7 +296,7 @@ async fn main() -> std::io::Result<()> {
     // Parse interfaces
     let mut interfaces = Vec::new();
     for spec in &args.interfaces {
-        match InterfaceSpec::parse_and_connect(spec).await {
+        match CandumpInterface::parse_and_connect(spec).await {
             Ok(i) => {
                 interfaces.push(i);
             }
