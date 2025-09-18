@@ -1,6 +1,5 @@
 use clap::{ArgAction, Parser};
-use crosscan::can::CanFrame;
-use crosscan::win_can::CanSocket;
+use crosscan::{CanInterface, can::CanFrame, win_can::WindowsCan};
 use futures::future::join_all;
 use tokio::task;
 use tokio::time::{Duration, sleep};
@@ -211,7 +210,7 @@ impl Filter {
 pub struct CandumpInterface {
     pub ifname: String,
     pub filters: Vec<Filter>,
-    pub pipe: CanSocket,
+    pub pipe: WindowsCan,
 }
 
 impl CandumpInterface {
@@ -344,11 +343,11 @@ async fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-async fn connect_pipe_retry(channel: &str) -> CanSocket {
+async fn connect_pipe_retry(channel: &str) -> WindowsCan {
     println!("Attempting to connect to {} server", channel);
 
     loop {
-        match CanSocket::open_read_only(channel) {
+        match WindowsCan::open_read_only(channel) {
             Ok(pipe) => {
                 println!("Connected to {} server", channel);
                 return pipe;

@@ -233,8 +233,8 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "crosscan"
-version = "0.1.0"
-source = "git+https://github.com/Cyborg-Dynamics-Engineering/cross-can.git#9f1f70ef3dd4b3af20815c94fc12f52dd4808fde"
+version = "0.1.1"
+source = "git+https://github.com/Cyborg-Dynamics-Engineering/cross-can.git?branch=main#c78ee0a541968a88aedb38b0495e722b30bbed37"
 dependencies = [
  "async-trait",
  "serde",
