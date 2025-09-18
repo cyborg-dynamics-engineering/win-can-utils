@@ -26,23 +26,23 @@ Download & run the latest .msi installer from [Releases](https://github.com/Cybo
 Opens a serial line CAN connection to an slcan adapter and exposes it via Windows [pipe](https://learn.microsoft.com/en-us/windows/win32/ipc/pipes).<br>
 To find the adapter, open 'Device Manager' and look in the 'Ports (COM & LPT)' dropdown.
 ```
-Usage: can_server <port> [--bitrate <bitrate>]
-Example: can_server COM5 --bitrate 1000000
+Usage: canserver <port> [--bitrate <bitrate>]
+Example: canserver COM5 --bitrate 1000000
 ```
 
 ### CAN Dump
 Prints realtime CAN data from an open CAN pipe to standard output.
 ```
-Usage: can_dump <port>
-Example: can_dump COM5
+Usage: candump <port>
+Example: candump COM5
 ```
 NOTE: A CAN server instance **must** be open for the target port.
 
 ### CAN Send
 Sends the given CAN frame to an open CAN pipe.
 ```
-Usage: can_send <port> <ID#DATA>
-Example: can_send COM5 055#00
+Usage: cansend <port> <ID#DATA>
+Example: cansend COM5 055#00
 ```
 NOTE: A CAN server instance **must** be open for the target port.
 
