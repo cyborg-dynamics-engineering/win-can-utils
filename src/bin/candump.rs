@@ -313,7 +313,7 @@ async fn main() -> std::io::Result<()> {
 
             // Get timestamp string. If no -t option, it will return an empty string ("").
             let ts_str = ts_ctx.get_timestamp(&frame).map_or(String::new(), |t| {
-                format!("({}.{:06}) ", t / 1_000_000, t % 1_000_000)
+                format!("({:03}.{:06}) ", t / 1_000_000, t % 1_000_000)
             });
 
             let id = match frame.is_extended() {
