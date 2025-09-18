@@ -61,7 +61,7 @@
     <Product
         Id='*'
         Name='win_can_utils'
-        UpgradeCode='F2235D87-74A7-484F-BB49-9A4748E94987'
+        UpgradeCode='5FDB9469-B5D2-47E3-81F3-5F60BC231B2C'
         Manufacturer='Timothy Mead; Ryan Marple'
         Language='1033'
         Codepage='1252'
@@ -110,7 +110,7 @@
                     -->
 
                     <Directory Id='Bin' Name='bin'>
-                        <Component Id='Path' Guid='AE9812A8-4F58-4B46-9C70-02ED72306AA4' KeyPath='yes'>
+                        <Component Id='Path' Guid='FEB7FCA3-956E-467A-8230-DABF2EC9D0C2' KeyPath='yes'>
                             <Environment
                                 Id='PATH'
                                 Name='PATH'
@@ -123,25 +123,25 @@
                         <Component Id='binary0' Guid='*'>
                             <File
                                 Id='exe0'
-                                Name='can_dump.exe'
+                                Name='candump.exe'
                                 DiskId='1'
-                                Source='$(var.CargoTargetBinDir)\can_dump.exe'
+                                Source='$(var.CargoTargetBinDir)\candump.exe'
                                 KeyPath='yes'/>
                         </Component>
                         <Component Id='binary1' Guid='*'>
                             <File
                                 Id='exe1'
-                                Name='can_send.exe'
+                                Name='cansend.exe'
                                 DiskId='1'
-                                Source='$(var.CargoTargetBinDir)\can_send.exe'
+                                Source='$(var.CargoTargetBinDir)\cansend.exe'
                                 KeyPath='yes'/>
                         </Component>
                         <Component Id='binary2' Guid='*'>
                             <File
                                 Id='exe2'
-                                Name='can_server.exe'
+                                Name='canserver.exe'
                                 DiskId='1'
-                                Source='$(var.CargoTargetBinDir)\can_server.exe'
+                                Source='$(var.CargoTargetBinDir)\canserver.exe'
                                 KeyPath='yes'/>
                         </Component>
                     </Directory>
