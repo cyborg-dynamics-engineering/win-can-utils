@@ -26,7 +26,7 @@ Download & run the latest .msi installer from [Releases](https://github.com/Cybo
 Opens a serial line CAN connection to an slcan adapter and exposes it via Windows [pipe](https://learn.microsoft.com/en-us/windows/win32/ipc/pipes).<br>
 To find the adapter, open 'Device Manager' and look in the 'Ports (COM & LPT)' dropdown.
 ```
-Usage: can_send <port> [--bitrate <ID#DATA>]
+Usage: can_server <port> [--bitrate <bitrate>]
 Example: can_server COM5 --bitrate 1000000
 ```
 
@@ -66,12 +66,7 @@ To flash the device, perform the following steps:
 10. Attempt to open a can_server using the device to determine whether flashing was successful.
 
 ## License
-Windows CAN Utils is licensed under either of
-
-    Apache License, Version 2.0 (LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0)
-    MIT license (LICENSE-MIT or http://opensource.org/licenses/MIT)
-
-at your option.
+Windows CAN Utils is licensed under either of Apache License, Version 2.0 (LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0) or MIT license (LICENSE-MIT or http://opensource.org/licenses/MIT) at your option.
 
 ## Developers
 
