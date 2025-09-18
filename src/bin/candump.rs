@@ -1,6 +1,8 @@
 use clap::{ArgAction, Parser};
 use crosscan::can::CanFrame;
 use crosscan::win_can::CanSocket;
+use futures::future::join_all;
+use tokio::task;
 use tokio::time::{Duration, sleep};
 
 use std::num::ParseIntError;
@@ -194,6 +196,18 @@ pub enum Filter {
     Join,
 }
 
+impl Filter {
+    /// Returns true if this filter matches the given CAN ID
+    pub fn matches(&self, can_id: u32) -> bool {
+        match *self {
+            Filter::Match { id, mask } => (can_id & mask) == (id & mask),
+            Filter::NotMatch { id, mask } => (can_id & mask) != (id & mask),
+            Filter::ErrorMask(_) => false, // error filters are not for normal CAN IDs
+            Filter::Join => true,          // Join is logical AND, doesn't filter on its own
+        }
+    }
+}
+
 pub struct CandumpInterface {
     pub ifname: String,
     pub filters: Vec<Filter>,
@@ -258,6 +272,26 @@ impl CandumpInterface {
             pipe,
         })
     }
+
+    /// Returns true if the given CAN ID passes all filters for this interface
+    pub fn filter_check(&self, can_id: u32) -> bool {
+        let mut matched = false;
+        let mut join_mode = false;
+        for f in &self.filters {
+            match f {
+                Filter::Join => join_mode = true,
+                Filter::ErrorMask(_) => {}
+                _ => {
+                    if join_mode {
+                        matched &= f.matches(can_id);
+                    } else {
+                        matched |= f.matches(can_id);
+                    }
+                }
+            }
+        }
+        matched
+    }
 }
 
 fn is_hex(s: &str) -> bool {
@@ -291,8 +325,6 @@ async fn main() -> std::io::Result<()> {
         .and_then(TimestampMode::from_char)
         .unwrap_or(TimestampMode::None);
 
-    let mut ts_ctx = TimestampCtx::new(ts_mode, args.hardware_ts);
-
     // Parse interfaces
     let mut interfaces = Vec::new();
     for spec in &args.interfaces {
@@ -307,35 +339,9 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    loop {
-        for interface in &mut interfaces {
-            let frame = interface.pipe.read_frame().await?;
+    let _ = run_interfaces(interfaces, ts_mode, args.hardware_ts).await;
 
-            // Get timestamp string. If no -t option, it will return an empty string ("").
-            let ts_str = ts_ctx.get_timestamp(&frame).map_or(String::new(), |t| {
-                format!("({:03}.{:06}) ", t / 1_000_000, t % 1_000_000)
-            });
-
-            let id = match frame.is_extended() {
-                true => format!("{:08X}", frame.id()),
-                false => format!("{:03X}", frame.id()),
-            };
-
-            println!(
-                "{}{} {:>08}   [{}]  {}",
-                ts_str,
-                interface.ifname,
-                id,
-                frame.dlc(),
-                frame
-                    .data()
-                    .iter()
-                    .map(|b| format!("{:02X}", b))
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            );
-        }
-    }
+    Ok(())
 }
 
 async fn connect_pipe_retry(channel: &str) -> CanSocket {
@@ -353,4 +359,67 @@ async fn connect_pipe_retry(channel: &str) -> CanSocket {
             }
         };
     }
+}
+
+// Assuming interfaces is a Vec<Interface> or similar
+async fn run_interfaces(
+    interfaces: Vec<CandumpInterface>,
+    ts_mode: TimestampMode,
+    hardware_ts: bool,
+) -> anyhow::Result<()> {
+    let mut handles = Vec::new();
+
+    for mut interface in interfaces.into_iter() {
+        // Clone or move anything needed into the task
+        let mut ts_ctx = TimestampCtx::new(ts_mode, hardware_ts);
+
+        let handle = task::spawn(async move {
+            loop {
+                match interface.pipe.read_frame().await {
+                    Ok(frame) => {
+                        if interface.filters.len() > 0 && !interface.filter_check(frame.id()) {
+                            continue;
+                        }
+
+                        // timestamp string
+                        let ts_str = ts_ctx.get_timestamp(&frame).map_or(String::new(), |t| {
+                            format!("({:03}.{:06}) ", t / 1_000_000, t % 1_000_000)
+                        });
+
+                        // CAN ID string
+                        let id = if frame.is_extended() {
+                            format!("{:08X}", frame.id())
+                        } else {
+                            format!("{:03X}", frame.id())
+                        };
+
+                        println!(
+                            "{}{} {:>08}   [{}]  {}",
+                            ts_str,
+                            interface.ifname,
+                            id,
+                            frame.dlc(),
+                            frame
+                                .data()
+                                .iter()
+                                .map(|b| format!("{:02X}", b))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Error reading from {}: {:?}", interface.ifname, e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    // Wait for all tasks to finish (they won’t unless error occurs)
+    join_all(handles).await;
+
+    Ok(())
 }
