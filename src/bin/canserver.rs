@@ -9,17 +9,19 @@ use tokio::signal;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
-use win_can_utils;
+use win_can_utils::{CanDriver, SlcanDriver, thread_manager_async};
 
 #[derive(Parser, Debug)]
 struct Cli {
+    #[arg(short = 'd', long = "driver", default_value = "slcan")]
+    driver: String,
     channel: String,
     #[arg(short = 'b', long = "bitrate")]
     bitrate: Option<u32>,
 }
 
-async fn init_can_async(cli: &Cli) -> std::io::Result<win_can_utils::SlcanDriver> {
-    let mut can_driver = match win_can_utils::SlcanDriver::open(&cli.channel) {
+async fn init_slcan(cli: &Cli) -> std::io::Result<Box<dyn CanDriver>> {
+    let mut slcan_driver = match SlcanDriver::open(&cli.channel).await {
         Ok(d) => d,
         Err(_) => {
             return Err(std::io::Error::new(
@@ -32,18 +34,10 @@ async fn init_can_async(cli: &Cli) -> std::io::Result<win_can_utils::SlcanDriver
         }
     };
 
-    if can_driver.close_channel().is_err() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "Could not open serial port {}. Is it an slcan device?",
-                &cli.channel
-            ),
-        ));
-    }
+    slcan_driver.close_channel().await?;
 
     // Get slcan driver version
-    let firmware_version = match can_driver.get_version() {
+    let firmware_version = match slcan_driver.get_version().await {
         Ok(s) => s,
         Err(_) => {
             return Err(std::io::Error::new(
@@ -53,17 +47,12 @@ async fn init_can_async(cli: &Cli) -> std::io::Result<win_can_utils::SlcanDriver
         }
     };
 
-    println!(
-        "SLCan Connected on {}. FW Version: {}",
-        &cli.channel, firmware_version
-    );
-
     let bitrate = match cli.bitrate {
         Some(b) => b,
         None => {
             let is_cyder_fw = firmware_version.starts_with("CYDER-CANABLE");
             if is_cyder_fw {
-                match can_driver.get_measured_bitrate() {
+                match slcan_driver.get_measured_bitrate().await {
                     Ok(b) => {
                         println!("Using measured bitrate: {}", b);
                         b
@@ -84,34 +73,53 @@ async fn init_can_async(cli: &Cli) -> std::io::Result<win_can_utils::SlcanDriver
         }
     };
 
-    can_driver.set_can_bitrate(bitrate)?;
-    can_driver.enable_timestamp()?;
-    can_driver.open_channel()?;
-    Ok(can_driver)
+    println!(
+        "SLCan Connected on {}. FW Version: {}",
+        &cli.channel, firmware_version
+    );
+
+    slcan_driver.set_bitrate(bitrate).await?;
+    slcan_driver.enable_timestamp().await?;
+    slcan_driver.open_channel().await?;
+
+    Ok(Box::new(slcan_driver))
 }
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
 
-    let driver = match init_can_async(&cli).await {
-        Ok(d) => d,
+    // Initialize the specified driver.
+    let driver = match cli.driver.to_lowercase().as_str() {
+        "slcan" => init_slcan(&cli).await,
+        _ => {
+            eprintln!(
+                "Did not recognize driver specified: {}\nSupported drivers are: slcan",
+                cli.driver
+            );
+            exit(1);
+        }
+    };
+
+    // Check driver start errors.
+    let driver = match driver {
+        Ok(driver) => Arc::new(Mutex::new(driver)),
         Err(e) => {
             eprintln!("{}", e.to_string());
             exit(1);
         }
     };
-    let driver = Arc::new(Mutex::new(driver));
+
     let shutdown = Arc::new(AtomicBool::new(false));
 
     let (tx_out_pipe, rx_out_pipe) = mpsc::channel::<String>(100);
     let (tx_in_pipe, mut rx_in_pipe) = mpsc::channel::<String>(100);
 
-    tokio::spawn(win_can_utils::thread_manager_async::start_ipc_reader(
+    tokio::spawn(thread_manager_async::start_ipc_reader(
         cli.channel.clone(),
         tx_in_pipe,
     ));
-    tokio::spawn(win_can_utils::thread_manager_async::start_ipc_writer(
+    tokio::spawn(thread_manager_async::start_ipc_writer(
         cli.channel.clone(),
         rx_out_pipe,
     ));
@@ -124,7 +132,7 @@ async fn main() -> std::io::Result<()> {
         println!("Ctrl+C received, shutting down...");
         shutdown_clone.store(true, Ordering::SeqCst);
 
-        if let Err(e) = driver_clone.lock().await.close_channel() {
+        if let Err(e) = driver_clone.lock().await.close_channel().await {
             eprintln!("Failed to close CAN driver: {:?}", e);
         } else {
             println!("CAN driver closed.");
@@ -141,7 +149,7 @@ async fn main() -> std::io::Result<()> {
                 match serde_json::from_str::<CanFrame>(&line) {
                     Ok(frame) => {
                         let mut d = driver.lock().await;
-                        if let Err(e) = d.send_frame(&frame) {
+                        if let Err(e) = d.send_frame(&frame).await {
                             eprintln!("Failed to send CAN frame: {:?}", e);
                         } else {
                             println!("Sent CAN frame ID=0x{:X}", frame.id());
@@ -161,7 +169,7 @@ async fn main() -> std::io::Result<()> {
 
         // Now read frames from CAN and send out
         {
-            match driver.lock().await.read_frames() {
+            match driver.lock().await.read_frames().await {
                 Ok(frames) => {
                     for frame in frames {
                         let mut json = serde_json::to_string(&frame).unwrap_or_default();

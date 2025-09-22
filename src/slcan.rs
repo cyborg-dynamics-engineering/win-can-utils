@@ -1,32 +1,25 @@
+use async_trait::async_trait;
 /// Provides the SlcanDriver that exposes a serial port as a CAN interface.
 use crosscan::can::CanFrame;
-use serialport::SerialPort;
-use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Mutex;
+use tokio_serial::SerialStream;
+
+use crate::can_driver::CanDriver;
 
 pub struct SlcanDriver {
-    port: Box<dyn SerialPort>,
+    port: Mutex<tokio_serial::SerialStream>,
     leftover: Vec<u8>, // Buffer to store partial incoming data between reads
     timestamp_high: u32,
     configured_bitrate: Option<u32>,
 }
 
 impl SlcanDriver {
-    pub fn try_clone(&self) -> std::io::Result<Self> {
-        let cloned = self.port.try_clone()?;
-        Ok(SlcanDriver {
-            port: cloned,
-            leftover: Vec::new(),
-            timestamp_high: self.timestamp_high,
-            configured_bitrate: self.configured_bitrate,
-        })
-    }
-
     /// Open serial port and initialize driver, optionally enabling SLCAN timestamp
-    pub fn open(port_name: &str) -> std::io::Result<Self> {
-        let port = serialport::new(port_name, 230_400)
-            .timeout(Duration::from_millis(1))
-            .open()?;
+    pub async fn open(port_name: &str) -> std::io::Result<Self> {
+        let builder = tokio_serial::new(port_name, 230_400);
+        let port = Mutex::new(SerialStream::open(&builder)?);
 
         Ok(SlcanDriver {
             port,
@@ -34,90 +27,6 @@ impl SlcanDriver {
             timestamp_high: 0,
             configured_bitrate: None,
         })
-    }
-
-    /// Enable timestamp support on the SLCAN device
-    pub fn enable_timestamp(&mut self) -> std::io::Result<()> {
-        self.port.write_all(b"Z1\r")?;
-        Ok(())
-    }
-
-    pub fn set_can_bitrate(&mut self, bitrate: u32) -> std::io::Result<()> {
-        let cmd = match bitrate {
-            10_000 => b"S0\r",
-            20_000 => b"S1\r",
-            50_000 => b"S2\r",
-            100_000 => b"S3\r",
-            125_000 => b"S4\r",
-            250_000 => b"S5\r",
-            500_000 => b"S6\r",
-            800_000 => b"S7\r",
-            1_000_000 => b"S8\r",
-            _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("Unsupported CAN bitrate: {}", bitrate),
-                ));
-            }
-        };
-
-        self.configured_bitrate = Some(bitrate);
-        self.port.write_all(cmd)
-    }
-
-    pub fn open_channel(&mut self) -> std::io::Result<()> {
-        self.port.write_all(b"O\r") // Open CAN channel
-    }
-
-    pub fn send_frame(&mut self, frame: &CanFrame) -> std::io::Result<()> {
-        let mut cmd = String::with_capacity(20 + frame.data().len() * 2);
-
-        if frame.is_extended() {
-            cmd.push('T');
-            cmd.push_str(&format!("{:08X}", frame.id()));
-        } else {
-            cmd.push('t');
-            cmd.push_str(&format!("{:03X}", frame.id()));
-        }
-
-        cmd.push_str(&format!("{}", frame.dlc()));
-
-        for byte in frame.data() {
-            cmd.push_str(&format!("{:02X}", byte));
-        }
-
-        cmd.push('\r');
-        self.port.write_all(cmd.as_bytes())
-    }
-
-    /// Read all available CAN frames from serial input
-    pub fn read_frames(&mut self) -> std::io::Result<Vec<CanFrame>> {
-        let mut buf = [0u8; 1024];
-        let mut frames = Vec::new();
-
-        loop {
-            match self.port.read(&mut buf) {
-                Ok(n) if n > 0 => {
-                    self.leftover.extend_from_slice(&buf[..n]);
-
-                    while let Some(pos) = self.leftover.iter().position(|&b| b == b'\r') {
-                        let line = self.leftover.drain(..=pos).collect::<Vec<_>>();
-                        if let Some(frame) = self.parse_slcan_line_bytes(&line) {
-                            frames.push(frame);
-                        }
-                    }
-                }
-                Err(ref e)
-                    if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
-                {
-                    break;
-                }
-                Err(e) => return Err(e),
-                _ => break,
-            }
-        }
-
-        Ok(frames)
     }
 
     /// Parse SLCAN frame line from bytes, optionally with timestamp
@@ -201,30 +110,22 @@ impl SlcanDriver {
         Some(frame)
     }
 
-    /// Close the CAN channel cleanly
-    pub fn close_channel(&mut self) -> std::io::Result<()> {
-        self.port.write_all(b"C\r")?;
-        self.port.flush()?;
-        Ok(())
-    }
-
-    pub fn get_configured_bitrate(&self) -> Option<u32> {
-        self.configured_bitrate
-    }
-
-    pub fn get_measured_bitrate(&mut self) -> std::io::Result<u32> {
+    pub async fn get_measured_bitrate(&mut self) -> std::io::Result<u32> {
         const SUPPORTED_BITRATES: [u32; 9] = [
             10_000, 20_000, 50_000, 100_000, 125_000, 250_000, 500_000, 800_000, 1_000_000,
         ];
 
         self.leftover.clear();
-
-        self.port.write_all(b"B\r")?;
-        self.port.flush()?; // ensure it's sent
+        // Request bitrate
+        {
+            let mut port = self.port.lock().await;
+            port.write_all(b"B\r").await?;
+            port.flush().await?;
+        }
 
         let mut buf = [0u8; 4];
         let mut received = 0;
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let timeout = Duration::from_millis(500);
 
         while received < 4 {
@@ -235,15 +136,14 @@ impl SlcanDriver {
                 ));
             }
 
-            match self.port.read(&mut buf[received..]) {
-                Ok(n) if n > 0 => received += n,
-                Ok(_) => continue,
-                Err(ref e)
-                    if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => return Err(e),
+            // Await instead of busy-looping
+            let mut port = self.port.lock().await;
+            let n = port.read(&mut buf[received..]).await?;
+            if n > 0 {
+                received += n;
+            } else {
+                // yield briefly
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
 
@@ -256,26 +156,27 @@ impl SlcanDriver {
             ));
         }
 
-        // Find the closest supported bitrate
+        // Find closest supported bitrate
         let closest = *SUPPORTED_BITRATES
             .iter()
             .min_by_key(|&&rate| (rate as i64 - actual as i64).abs())
-            .unwrap(); // Safe unwrap — list is non-empty
+            .unwrap();
 
         Ok(closest)
     }
 
-    pub fn get_version(&mut self) -> std::io::Result<String> {
+    pub async fn get_version(&mut self) -> std::io::Result<String> {
         self.leftover.clear();
 
-        self.port.write_all(b"V\r")?;
-        self.port.flush()?;
+        let mut port = self.port.lock().await;
+        port.write_all(b"V\r").await?;
+        port.flush().await?;
 
-        let mut reader = BufReader::new(&mut self.port);
+        let mut reader = BufReader::new(&mut *port);
         let mut buf = Vec::new();
 
         loop {
-            reader.read_until(b'\r', &mut buf)?;
+            reader.read_until(b'\r', &mut buf).await?;
 
             if buf[0] != b'T' {
                 break;
@@ -285,5 +186,104 @@ impl SlcanDriver {
         }
 
         Ok(String::from_utf8_lossy(&buf).trim().to_string())
+    }
+}
+
+#[async_trait]
+impl CanDriver for SlcanDriver {
+    /// Enable timestamp support on the SLCAN device
+    async fn enable_timestamp(&mut self) -> std::io::Result<()> {
+        let mut port = self.port.lock().await;
+        port.write_all(b"Z1\r").await?;
+        Ok(())
+    }
+
+    async fn set_bitrate(&mut self, bitrate: u32) -> std::io::Result<()> {
+        let cmd = match bitrate {
+            10_000 => b"S0\r",
+            20_000 => b"S1\r",
+            50_000 => b"S2\r",
+            100_000 => b"S3\r",
+            125_000 => b"S4\r",
+            250_000 => b"S5\r",
+            500_000 => b"S6\r",
+            800_000 => b"S7\r",
+            1_000_000 => b"S8\r",
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Unsupported CAN bitrate: {}", bitrate),
+                ));
+            }
+        };
+
+        self.configured_bitrate = Some(bitrate);
+        let mut port = self.port.lock().await;
+        port.write_all(cmd).await
+    }
+
+    async fn open_channel(&mut self) -> std::io::Result<()> {
+        let mut port = self.port.lock().await;
+        port.write_all(b"O\r").await // Open CAN channel
+    }
+
+    async fn send_frame(&mut self, frame: &CanFrame) -> std::io::Result<()> {
+        let mut cmd = String::with_capacity(20 + frame.data().len() * 2);
+
+        if frame.is_extended() {
+            cmd.push('T');
+            cmd.push_str(&format!("{:08X}", frame.id()));
+        } else {
+            cmd.push('t');
+            cmd.push_str(&format!("{:03X}", frame.id()));
+        }
+
+        cmd.push_str(&format!("{}", frame.dlc()));
+
+        for byte in frame.data() {
+            cmd.push_str(&format!("{:02X}", byte));
+        }
+
+        cmd.push('\r');
+        let mut port = self.port.lock().await;
+        port.write_all(cmd.as_bytes()).await
+    }
+
+    async fn read_frames(&mut self) -> std::io::Result<Vec<CanFrame>> {
+        let mut buf = [0u8; 1024];
+        let mut frames = Vec::new();
+
+        // Scope the MutexGuard
+        {
+            let mut port = self.port.lock().await;
+            let n = port.read(&mut buf).await?;
+            if n > 0 {
+                self.leftover.extend_from_slice(&buf[..n]);
+            }
+        }
+
+        while let Some(pos) = {
+            let leftover = &self.leftover;
+            leftover.iter().position(|&b| b == b'\r')
+        } {
+            let line: Vec<u8> = self.leftover.drain(..=pos).collect();
+            if let Some(frame) = self.parse_slcan_line_bytes(&line) {
+                frames.push(frame);
+            }
+        }
+
+        Ok(frames)
+    }
+
+    /// Close the CAN channel cleanly
+    async fn close_channel(&mut self) -> std::io::Result<()> {
+        let mut port = self.port.lock().await;
+        port.write_all(b"C\r").await?;
+        port.flush().await?;
+        Ok(())
+    }
+
+    async fn get_bitrate(&self) -> Option<u32> {
+        self.configured_bitrate
     }
 }
