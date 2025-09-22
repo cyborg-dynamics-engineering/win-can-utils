@@ -9,18 +9,19 @@ use tokio::signal;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
-use win_can_utils::{self, CanDriver};
+use win_can_utils::{CanDriver, SlcanDriver, thread_manager_async};
 
 #[derive(Parser, Debug)]
 struct Cli {
+    #[arg(short = 'd', long = "driver", default_value = "slcan")]
     driver: String,
     channel: String,
     #[arg(short = 'b', long = "bitrate")]
     bitrate: Option<u32>,
 }
 
-async fn init_slcan(cli: &Cli) -> std::io::Result<Box<dyn win_can_utils::CanDriver>> {
-    let mut slcan_driver = match win_can_utils::SlcanDriver::open(&cli.channel).await {
+async fn init_slcan(cli: &Cli) -> std::io::Result<Box<dyn CanDriver>> {
+    let mut slcan_driver = match SlcanDriver::open(&cli.channel).await {
         Ok(d) => d,
         Err(_) => {
             return Err(std::io::Error::new(
@@ -114,11 +115,11 @@ async fn main() -> std::io::Result<()> {
     let (tx_out_pipe, rx_out_pipe) = mpsc::channel::<String>(100);
     let (tx_in_pipe, mut rx_in_pipe) = mpsc::channel::<String>(100);
 
-    tokio::spawn(win_can_utils::thread_manager_async::start_ipc_reader(
+    tokio::spawn(thread_manager_async::start_ipc_reader(
         cli.channel.clone(),
         tx_in_pipe,
     ));
-    tokio::spawn(win_can_utils::thread_manager_async::start_ipc_writer(
+    tokio::spawn(thread_manager_async::start_ipc_writer(
         cli.channel.clone(),
         rx_out_pipe,
     ));

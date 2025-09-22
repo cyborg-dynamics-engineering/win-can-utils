@@ -116,11 +116,12 @@ impl SlcanDriver {
         ];
 
         self.leftover.clear();
-
         // Request bitrate
-        let mut port = self.port.lock().await;
-        port.write_all(b"B\r").await?;
-        port.flush().await?;
+        {
+            let mut port = self.port.lock().await;
+            port.write_all(b"B\r").await?;
+            port.flush().await?;
+        }
 
         let mut buf = [0u8; 4];
         let mut received = 0;
