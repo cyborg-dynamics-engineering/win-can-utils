@@ -1,3 +1,4 @@
+use bincode;
 use clap::Parser;
 use crosscan::can::CanFrame;
 use std::process::exit;
@@ -112,8 +113,8 @@ async fn main() -> std::io::Result<()> {
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    let (tx_out_pipe, rx_out_pipe) = mpsc::channel::<String>(100);
-    let (tx_in_pipe, mut rx_in_pipe) = mpsc::channel::<String>(100);
+    let (tx_out_pipe, rx_out_pipe) = mpsc::channel::<Vec<u8>>(100);
+    let (tx_in_pipe, mut rx_in_pipe) = mpsc::channel::<Vec<u8>>(100);
 
     tokio::spawn(thread_manager_async::start_ipc_reader(
         cli.channel.clone(),
@@ -146,8 +147,11 @@ async fn main() -> std::io::Result<()> {
         match timeout(Duration::from_millis(5), rx_in_pipe.recv()).await {
             Ok(Some(line)) => {
                 // Got a line, process it
-                match serde_json::from_str::<CanFrame>(&line) {
-                    Ok(frame) => {
+                match bincode::serde::decode_from_slice::<CanFrame, _>(
+                    &line,
+                    bincode::config::standard(),
+                ) {
+                    Ok((frame, _)) => {
                         let mut d = driver.lock().await;
                         if let Err(e) = d.send_frame(&frame).await {
                             eprintln!("Failed to send CAN frame: {:?}", e);
@@ -172,12 +176,28 @@ async fn main() -> std::io::Result<()> {
             match driver.lock().await.read_frames().await {
                 Ok(frames) => {
                     for frame in frames {
-                        let mut json = serde_json::to_string(&frame).unwrap_or_default();
-                        json.push('\n');
+                        match bincode::serde::encode_to_vec(frame, bincode::config::standard()) {
+                            Ok(mut data) => {
+                                // Check that message length fits within a single byte
+                                if data.len() > (u8::MAX as usize) {
+                                    eprintln!(
+                                        "Serialized CanFrame is too large to send, size: {:?}",
+                                        data.len()
+                                    );
+                                }
 
-                        if let Err(_) = tx_out_pipe.try_send(json) {
-                            // If the IPC cannot be written to right now, move on until availble
-                            break;
+                                // Begin message with payload length byte
+                                let mut msg = vec![data.len() as u8];
+
+                                // Add CanFrame payload
+                                msg.append(&mut data);
+
+                                if let Err(_) = tx_out_pipe.try_send(msg) {
+                                    // If the IPC cannot be written to right now, break and move on until availble
+                                    break;
+                                }
+                            }
+                            Err(e) => eprintln!("Failed to serialize CanFrame: {:?}", e),
                         }
                     }
                 }
