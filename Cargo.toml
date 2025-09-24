@@ -14,7 +14,7 @@ serde = { version = "1.0", features = ["derive"] }
 clap = { version = "4.5", features = ["derive"] }
 ctrlc = "3.4.7"
 mpsc = "0.2.6"
-crosscan = { git = "https://github.com/Cyborg-Dynamics-Engineering/cross-can.git", branch = "main" }
+crosscan = { git = "https://github.com/Cyborg-Dynamics-Engineering/cross-can.git", rev = "850a96d" }
 tokio = { version = "1.47.1", features = ["full", "net"] }
 named_pipe = "0.4.1"
 futures = "0.3.31"

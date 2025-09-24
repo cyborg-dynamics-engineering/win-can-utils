@@ -177,9 +177,23 @@ async fn main() -> std::io::Result<()> {
                 Ok(frames) => {
                     for frame in frames {
                         match bincode::serde::encode_to_vec(frame, bincode::config::standard()) {
-                            Ok(data) => {
-                                if let Err(_) = tx_out_pipe.try_send(data) {
-                                    // If the IPC cannot be written to right now, move on until availble
+                            Ok(mut data) => {
+                                // Check that message length fits within a single byte
+                                if data.len() > (u8::MAX as usize) {
+                                    eprintln!(
+                                        "Serialized CanFrame is too large to send, size: {:?}",
+                                        data.len()
+                                    );
+                                }
+
+                                // Begin message with payload length byte
+                                let mut msg = vec![data.len() as u8];
+
+                                // Add CanFrame payload
+                                msg.append(&mut data);
+
+                                if let Err(_) = tx_out_pipe.try_send(msg) {
+                                    // If the IPC cannot be written to right now, break and move on until availble
                                     break;
                                 }
                             }
