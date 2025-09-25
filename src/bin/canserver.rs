@@ -10,7 +10,7 @@ use tokio::signal;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
-use win_can_utils::{CanDriver, SlcanDriver, thread_manager_async};
+use win_can_utils::{CanDriver, PcanDriver, SlcanDriver, thread_manager_async};
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -19,6 +19,45 @@ struct Cli {
     channel: String,
     #[arg(short = 'b', long = "bitrate")]
     bitrate: Option<u32>,
+}
+
+/// Initialize PCAN driver from CLI args.
+pub async fn init_pcan(cli: &Cli) -> std::io::Result<Box<dyn CanDriver>> {
+    // Try to open the PCAN channel (e.g., "USBBUS1")
+    let mut pcan_driver = match PcanDriver::open(&cli.channel).await {
+        Ok(d) => d,
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "Could not open PCAN channel {}. Is the device connected?",
+                    &cli.channel
+                ),
+            ));
+        }
+    };
+
+    // Close channel if left open (same pattern as SLCAN)
+    let _ = pcan_driver.close_channel().await;
+
+    // Pick bitrate from CLI or hardware
+    let bitrate = match cli.bitrate {
+        Some(b) => b,
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "No bitrate provided and failed to detect automatically. Use -b <bitrate>.",
+            ));
+        }
+    };
+
+    println!("PCAN Connected on {}", &cli.channel);
+
+    pcan_driver.set_bitrate(bitrate).await?;
+    pcan_driver.enable_timestamp().await?;
+    pcan_driver.open_channel().await?;
+
+    Ok(Box::new(pcan_driver))
 }
 
 async fn init_slcan(cli: &Cli) -> std::io::Result<Box<dyn CanDriver>> {
@@ -93,6 +132,7 @@ async fn main() -> std::io::Result<()> {
     // Initialize the specified driver.
     let driver = match cli.driver.to_lowercase().as_str() {
         "slcan" => init_slcan(&cli).await,
+        "pcan" => init_pcan(&cli).await,
         _ => {
             eprintln!(
                 "Did not recognize driver specified: {}\nSupported drivers are: slcan",
