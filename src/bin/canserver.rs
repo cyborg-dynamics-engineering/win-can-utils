@@ -22,18 +22,46 @@ struct Cli {
 }
 
 /// Initialize PCAN driver from CLI args.
-pub async fn init_pcan(cli: &Cli) -> std::io::Result<Box<dyn CanDriver>> {
+async fn init_pcan(cli: &Cli) -> std::io::Result<Box<dyn CanDriver>> {
     // Try to open the PCAN channel (e.g., "USBBUS1")
-    let mut pcan_driver = match PcanDriver::open(&cli.channel).await {
-        Ok(d) => d,
-        Err(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "Could not open PCAN channel {}. Is the device connected?",
-                    &cli.channel
-                ),
-            ));
+    let mut pcan_driver = if cli.channel.to_ascii_uppercase() == "AUTO" {
+        // Try common PCAN channels in order
+        let common_channels = [
+            "USBBUS1", "USBBUS2", "USBBUS3", "USBBUS4", "PCIBUS1", "PCIBUS2", "LANBUS1", "LANBUS2",
+        ];
+
+        let mut found: Option<PcanDriver> = None;
+        for ch in &common_channels {
+            if let Ok(driver) = PcanDriver::open(ch).await {
+                // Try to actually initialize the hardware (set bitrate later)
+                found = Some(driver);
+                println!("Auto-detected PCAN channel: {}", ch);
+                break;
+            }
+        }
+
+        match found {
+            Some(d) => d,
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Could not auto-detect a PCAN channel (tried USB, PCI, LAN).",
+                ));
+            }
+        }
+    } else {
+        // User gave a channel explicitly
+        match PcanDriver::open(&cli.channel).await {
+            Ok(d) => d,
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "Could not open PCAN channel {}. Is the device connected?",
+                        &cli.channel
+                    ),
+                ));
+            }
         }
     };
 
