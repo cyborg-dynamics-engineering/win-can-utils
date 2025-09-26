@@ -743,6 +743,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "peak-can-sys"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abdc770c146d436e8eae98775b740e9f19df2ad892fd99405196866aae500c29"
+
+[[package]]
 name = "pin-project"
 version = "1.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1192,6 +1198,7 @@ dependencies = [
  "futures",
  "mpsc",
  "named_pipe",
+ "peak-can-sys",
  "ringbuf",
  "serde",
  "serialport",

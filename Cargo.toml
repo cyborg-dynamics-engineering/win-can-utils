@@ -22,6 +22,7 @@ anyhow = "1.0.99"
 async-trait = "0.1.89"
 tokio-serial = "5.4.5"
 bincode = { version = "2.0.1", features = ["serde"] }
+peak-can-sys = "0.1.2"
 
 [package.metadata.wix]
 eula = "LICENSE.rtf"
