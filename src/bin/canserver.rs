@@ -2,14 +2,11 @@ use bincode;
 use clap::Parser;
 use crosscan::can::CanFrame;
 use std::process::exit;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, atomic::AtomicBool};
 use tokio::signal;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
-use tokio::time::{Duration, timeout};
+use tokio::time::Duration;
 use win_can_utils::{CanDriver, PcanDriver, SlcanDriver, thread_manager_async};
 
 #[derive(Parser, Debug)]
@@ -207,6 +204,7 @@ async fn main() -> std::io::Result<()> {
                 if let Err(e) = d.send_frame(&frame).await {
                     eprintln!("Failed to send CAN frame: {:?}", e);
                 }
+                println!("Sent");
             }
         }
         // channel closed → exit loop
