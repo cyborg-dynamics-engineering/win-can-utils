@@ -235,6 +235,7 @@ async fn main() -> std::io::Result<()> {
         loop {
             match driver_out.lock().await.read_frames().await {
                 Ok(frames) => {
+                    // println!("{:?}", frames);
                     for frame in frames {
                         if let Ok(mut data) =
                             bincode::serde::encode_to_vec(frame, bincode::config::standard())

@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use crosscan::can::CanFrame;
-use libc::timeval;
 use libusb1_sys as libusb;
 use libusb1_sys::constants::{
     LIBUSB_CONTROL_SETUP_SIZE, LIBUSB_ENDPOINT_IN, LIBUSB_ENDPOINT_OUT, LIBUSB_ERROR_INTERRUPTED,
@@ -13,6 +12,7 @@ use libusb1_sys::constants::{
 };
 use std::cmp::min;
 use std::ffi::CStr;
+use std::io;
 use std::mem::MaybeUninit;
 use std::os::raw::{c_int, c_uint, c_void};
 use std::ptr;
@@ -20,8 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
-use std::{io, thread};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::can_driver::CanDriver;
 
@@ -46,7 +45,7 @@ const GS_MAX_DATA: usize = 64; // max CAN(-FD) payload
 const GS_MAX_FRAME_LEN: usize = GS_HEADER_LEN + GS_TS_LEN + GS_MAX_DATA; // 80
 
 // choose a sane USB bulk read size (multiple frames)
-const USB_READ_BYTES: usize = 8 * 1024;
+const USB_READ_BYTES: usize = 80;
 
 const CAN_EFF_FLAG: u32 = 0x8000_0000;
 const CAN_RTR_FLAG: u32 = 0x4000_0000;
@@ -260,13 +259,23 @@ impl Drop for LibusbContext {
     }
 }
 
+#[derive(Clone)]
 struct LibusbDeviceHandle {
     context: Arc<LibusbContext>,
-    handle: *mut libusb::libusb_device_handle,
+    handle: Arc<LibusbHandleWrapper>,
 }
+struct LibusbHandleWrapper(*mut libusb::libusb_device_handle);
 
-unsafe impl Send for LibusbDeviceHandle {}
-unsafe impl Sync for LibusbDeviceHandle {}
+unsafe impl Send for LibusbHandleWrapper {}
+unsafe impl Sync for LibusbHandleWrapper {}
+
+impl Drop for LibusbHandleWrapper {
+    fn drop(&mut self) {
+        unsafe {
+            libusb::libusb_close(self.0);
+        }
+    }
+}
 
 impl LibusbDeviceHandle {
     fn open(context: Arc<LibusbContext>, device: *mut libusb::libusb_device) -> io::Result<Self> {
@@ -275,16 +284,19 @@ impl LibusbDeviceHandle {
         if rc < 0 {
             return Err(map_libusb_error(rc));
         }
-        Ok(Self { context, handle })
+        Ok(Self {
+            context,
+            handle: Arc::new(LibusbHandleWrapper(handle)),
+        })
     }
 
     fn raw(&self) -> *mut libusb::libusb_device_handle {
-        self.handle
+        self.handle.0
     }
 
     fn set_auto_detach_kernel_driver(&self, enable: bool) -> io::Result<()> {
         let flag = if enable { 1 } else { 0 };
-        let rc = unsafe { libusb::libusb_set_auto_detach_kernel_driver(self.handle, flag) };
+        let rc = unsafe { libusb::libusb_set_auto_detach_kernel_driver(self.handle.0, flag) };
         if rc < 0 && rc != LIBUSB_ERROR_NOT_SUPPORTED {
             return Err(map_libusb_error(rc));
         }
@@ -292,7 +304,7 @@ impl LibusbDeviceHandle {
     }
 
     fn claim_interface(&self, interface: i32) -> io::Result<()> {
-        let rc = unsafe { libusb::libusb_claim_interface(self.handle, interface) };
+        let rc = unsafe { libusb::libusb_claim_interface(self.handle.0, interface) };
         if rc < 0 {
             return Err(map_libusb_error(rc));
         }
@@ -300,7 +312,7 @@ impl LibusbDeviceHandle {
     }
 
     fn clear_halt(&self, endpoint: u8) -> io::Result<()> {
-        let rc = unsafe { libusb::libusb_clear_halt(self.handle, endpoint) };
+        let rc = unsafe { libusb::libusb_clear_halt(self.handle.0, endpoint) };
         if rc < 0 {
             return Err(map_libusb_error(rc));
         }
@@ -330,7 +342,7 @@ impl LibusbDeviceHandle {
             ));
         }
         unsafe {
-            (*transfer).dev_handle = self.handle;
+            (*transfer).dev_handle = self.handle.0;
             (*transfer).endpoint = endpoint;
             (*transfer).transfer_type = LIBUSB_TRANSFER_TYPE_BULK;
             (*transfer).timeout = duration_to_timeout(timeout);
@@ -381,7 +393,7 @@ impl LibusbDeviceHandle {
             ));
         }
         unsafe {
-            (*transfer).dev_handle = self.handle;
+            (*transfer).dev_handle = self.handle.0;
             (*transfer).endpoint = endpoint;
             (*transfer).transfer_type = LIBUSB_TRANSFER_TYPE_BULK;
             (*transfer).timeout = duration_to_timeout(timeout);
@@ -447,7 +459,7 @@ impl LibusbDeviceHandle {
             ));
         }
         unsafe {
-            (*transfer).dev_handle = self.handle;
+            (*transfer).dev_handle = self.handle.0;
             (*transfer).endpoint = 0;
             (*transfer).transfer_type = LIBUSB_TRANSFER_TYPE_CONTROL;
             (*transfer).timeout = duration_to_timeout(timeout);
@@ -472,14 +484,6 @@ impl LibusbDeviceHandle {
                 io::ErrorKind::Other,
                 "Control transfer channel closed",
             )),
-        }
-    }
-}
-
-impl Drop for LibusbDeviceHandle {
-    fn drop(&mut self) {
-        unsafe {
-            libusb::libusb_close(self.handle);
         }
     }
 }
@@ -874,39 +878,26 @@ fn plausible_header(hdr: &[u8], expected_chan: u8) -> bool {
     if hdr.len() < GS_HEADER_LEN {
         return false;
     }
-    // header fields we can sanity-check quickly
-    let _echo = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
-    let _id = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+
     let dlc = hdr[8];
     let chan = hdr[9];
-    // flags := hdr[10], reserved := hdr[11]
-
-    // DLC must map to <=64 bytes
     let len = dlc_to_len(dlc);
-    if len > GS_MAX_DATA {
-        return false;
-    }
 
-    // Channel should usually match (or at least be small). We prioritize exact match.
-    if chan != expected_chan {
-        return false;
-    }
-
-    true
+    // Only accept if DLC is valid and channel matches
+    len <= GS_MAX_DATA && chan == expected_chan
 }
 
 /// Parses one frame starting at bytes[0], returns (maybe_frame, consumed_len).
 fn parse_host_frame_at(
     bytes: &[u8],
     channel_index: u8,
-    _timestamp_enabled: bool, // advisory only; we adapt per-frame
+    _timestamp_enabled: bool,
     last_ts64: &mut Option<u64>,
 ) -> Option<(Option<CanFrame>, usize)> {
     if bytes.len() < GS_HEADER_LEN {
         return None;
     }
 
-    // Read minimal header
     let echo_id = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
     let raw_id = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
     let dlc = bytes[8];
@@ -914,76 +905,49 @@ fn parse_host_frame_at(
 
     let data_len = dlc_to_len(dlc);
     if data_len > GS_MAX_DATA {
-        // malformed dlc -> skip one byte to resync
-        return Some((None, 1));
+        return Some((None, 1)); // malformed dlc → resync
     }
 
-    // Consider two candidate layouts: without and with timestamp
     let len_no_ts = GS_HEADER_LEN + data_len;
     let len_with_ts = GS_HEADER_LEN + GS_TS_LEN + data_len;
 
-    // Decide which layout is more plausible by peeking at the next header (if available).
-    // Prefer a layout that leaves the next header aligned and plausible.
     let mut use_ts = false;
-    let have_no_ts = bytes.len() >= len_no_ts;
-    let have_with_ts = bytes.len() >= len_with_ts;
-
-    if have_with_ts && bytes.len() >= len_with_ts + GS_HEADER_LEN {
+    if bytes.len() >= len_with_ts + GS_HEADER_LEN {
         let next_hdr = &bytes[len_with_ts..len_with_ts + GS_HEADER_LEN];
         if plausible_header(next_hdr, channel_index) {
             use_ts = true;
         }
     }
 
-    if !use_ts && have_no_ts && bytes.len() >= len_no_ts + GS_HEADER_LEN {
-        let next_hdr = &bytes[len_no_ts..len_no_ts + GS_HEADER_LEN];
-        if plausible_header(next_hdr, channel_index) {
-            use_ts = false;
-        }
-    }
-
-    // If only one variant fits in the available bytes, take that.
     let total_len = if use_ts {
-        if !have_with_ts {
-            // not enough yet
+        if bytes.len() < len_with_ts {
             return None;
         }
         len_with_ts
     } else {
-        if !have_no_ts {
-            // try timestamped if that one fits
-            if have_with_ts {
-                use_ts = true;
-                len_with_ts
-            } else {
-                return None;
-            }
-        } else {
-            len_no_ts
+        if bytes.len() < len_no_ts {
+            return None;
         }
+        len_no_ts
     };
 
     if total_len == 0 || total_len > GS_MAX_FRAME_LEN {
-        return Some((None, 1)); // safety
+        return Some((None, 1));
     }
 
-    // Consume echoes / other channels but keep stream moving
+    // Skip echoes / wrong channels
     if echo_id != GS_CAN_ECHO_ID_UNUSED || chan != channel_index {
         return Some((None, total_len));
     }
 
-    // Data offset after optional timestamp
     let ts_off = GS_HEADER_LEN;
     let data_off = if use_ts {
         GS_HEADER_LEN + GS_TS_LEN
     } else {
         GS_HEADER_LEN
     };
-
-    // Bounds are guaranteed by total_len checks
     let data = &bytes[data_off..data_off + data_len];
 
-    // Build frame
     let mut frame = if (raw_id & CAN_ERR_FLAG) != 0 {
         CanFrame::new_error(raw_id & CAN_ERR_MASK).ok()?
     } else if (raw_id & CAN_RTR_FLAG) != 0 {
@@ -1004,7 +968,6 @@ fn parse_host_frame_at(
         CanFrame::new(raw_id & CAN_SFF_MASK, data).ok()?
     };
 
-    // Timestamp (if we selected the ts variant)
     if use_ts {
         let ts32 = u32::from_le_bytes(bytes[ts_off..ts_off + 4].try_into().unwrap()) as u64;
         let ts64 = match *last_ts64 {
@@ -1030,7 +993,6 @@ pub struct GsUsbDriver {
     interface: u8,
     in_ep: u8,
     out_ep: u8,
-    #[allow(dead_code)]
     int_ep: Option<u8>,
     channel_index: u8,
     configured_bitrate: Option<u32>,
@@ -1039,6 +1001,7 @@ pub struct GsUsbDriver {
     tx_counter: AtomicU32,
     device_label: String,
     last_timestamp64: Option<u64>,
+    frame_rx: Arc<Mutex<mpsc::Receiver<CanFrame>>>,
 }
 
 impl GsUsbDriver {
@@ -1049,7 +1012,10 @@ impl GsUsbDriver {
         let _ = handle.set_auto_detach_kernel_driver(true);
         handle.claim_interface(info.interface as i32)?;
 
-        let driver = GsUsbDriver {
+        // Create channel for background frames
+        let (tx, rx) = mpsc::channel::<CanFrame>(1024);
+
+        let mut driver = GsUsbDriver {
             handle,
             interface: info.interface,
             in_ep: info.in_ep,
@@ -1062,16 +1028,56 @@ impl GsUsbDriver {
             tx_counter: AtomicU32::new(0),
             device_label: label,
             last_timestamp64: None,
+            frame_rx: Arc::new(Mutex::new(rx)),
         };
 
-        let host_cfg = host_config_bytes();
-        driver
-            .send_control(GS_USB_BREQ_HOST_FORMAT, &host_cfg)
-            .await?;
-        let reset_bytes = encode_mode(GS_CAN_MODE_RESET, 0);
-        driver.send_control(GS_USB_BREQ_MODE, &reset_bytes).await?;
+        // Spawn background reader
+        let mut bg_driver = driver.clone_for_reader();
+        tokio::spawn(async move {
+            loop {
+                eprintln!("[bg] submitting read_frames_once"); // keep if you want occasional traces
+                match bg_driver.read_frames_once().await {
+                    Ok(frames) => {
+                        if !frames.is_empty() {
+                            eprintln!("[bg] got {} frames", frames.len());
+                        }
+                        for f in frames {
+                            if tx.send(f).await.is_err() {
+                                return; // receiver dropped
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("[background reader] error: {err}");
+                        return;
+                    }
+                }
+
+                // 🔑 Add this: prevents tight-loop CPU hogging when no frames arrive
+                tokio::task::yield_now().await;
+                // or: tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
 
         Ok(driver)
+    }
+
+    fn clone_for_reader(&self) -> Self {
+        GsUsbDriver {
+            handle: self.handle.clone(), // now safe Arc clone
+            interface: self.interface,
+            in_ep: self.in_ep,
+            out_ep: self.out_ep,
+            int_ep: self.int_ep,
+            channel_index: self.channel_index,
+            configured_bitrate: self.configured_bitrate,
+            timestamp_enabled: self.timestamp_enabled,
+            rx_leftover: Vec::with_capacity(HOST_FRAME_SIZE * 4),
+            tx_counter: AtomicU32::new(0),
+            device_label: self.device_label.clone(),
+            last_timestamp64: None,
+            frame_rx: self.frame_rx.clone(),
+        }
     }
 
     pub fn device_label(&self) -> &str {
@@ -1097,6 +1103,89 @@ impl GsUsbDriver {
             ));
         }
         Ok(())
+    }
+
+    async fn read_frames_once(&mut self) -> io::Result<Vec<CanFrame>> {
+        let mut first = true;
+
+        loop {
+            let timeout = if first {
+                USB_TIMEOUT
+            } else {
+                DRAIN_READ_TIMEOUT
+            };
+
+            let chunk = match self
+                .handle
+                .bulk_read(self.in_ep, USB_READ_BYTES, timeout)
+                .await
+            {
+                Ok(chunk) => chunk,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    // no data available right now, stop this iteration
+                    break;
+                }
+                Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {
+                    let _ = self.handle.clear_halt(self.in_ep);
+                    break;
+                }
+                Err(err) => return Err(err),
+            };
+
+            if chunk.is_empty() {
+                // don’t exit permanently, just keep polling next iteration
+                continue;
+            }
+
+            // eprintln!("[bg] bulk_read got {} bytes", chunk.len());
+            self.rx_leftover.extend_from_slice(&chunk);
+            first = false;
+
+            // Heuristic: short read means likely drained the device queue
+            if chunk.len() < USB_READ_BYTES {
+                break;
+            }
+        }
+
+        let mut frames = Vec::new();
+        let mut offset = 0usize;
+
+        while self.rx_leftover.len() >= offset + GS_HEADER_LEN {
+            let slice = &self.rx_leftover[offset..];
+            match parse_host_frame_at(
+                slice,
+                self.channel_index,
+                self.timestamp_enabled,
+                &mut self.last_timestamp64,
+            ) {
+                None => {
+                    // instead of breaking, advance by one to resync
+                    offset += 1;
+                    continue;
+                }
+                Some((maybe_frame, consumed)) => {
+                    let c = if consumed == 0 || consumed > GS_MAX_FRAME_LEN {
+                        1
+                    } else {
+                        consumed
+                    };
+                    if let Some(frame) = maybe_frame {
+                        // eprintln!("[bg] decoded frame: {:?}", frame);
+                        frames.push(frame);
+                    }
+                    offset += c;
+                }
+            }
+        }
+
+        if offset > 0 {
+            self.rx_leftover.drain(..offset);
+        }
+
+        // Prevent starving the event loop
+        tokio::task::yield_now().await;
+
+        Ok(frames)
     }
 }
 
@@ -1174,71 +1263,18 @@ impl CanDriver for GsUsbDriver {
     }
 
     async fn read_frames(&mut self) -> io::Result<Vec<CanFrame>> {
-        let mut first = true;
-        loop {
-            let timeout = if first {
-                USB_TIMEOUT
-            } else {
-                DRAIN_READ_TIMEOUT
-            };
-            let chunk = match self
-                .handle
-                .bulk_read(self.in_ep, USB_READ_BYTES, timeout)
-                .await
-            {
-                Ok(chunk) => chunk,
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    if first {
-                        return Ok(Vec::new());
-                    }
-                    break;
-                }
-                Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {
-                    let _ = self.handle.clear_halt(self.in_ep);
-                    break;
-                }
-                Err(err) => return Err(err),
-            };
-
-            if chunk.is_empty() {
-                if first {
-                    return Ok(Vec::new());
-                }
-                break;
-            }
-            first = false;
-            self.rx_leftover.extend_from_slice(&chunk);
-        }
-
         let mut frames = Vec::new();
-        let mut offset = 0usize;
 
-        while self.rx_leftover.len() >= offset + GS_HEADER_LEN {
-            let slice = &self.rx_leftover[offset..];
-            match parse_host_frame_at(
-                slice,
-                self.channel_index,
-                self.timestamp_enabled, // advisory only now
-                &mut self.last_timestamp64,
-            ) {
-                None => break, // need more bytes
-                Some((maybe_frame, consumed)) => {
-                    let c = if consumed == 0 || consumed > GS_MAX_FRAME_LEN {
-                        1
-                    } else {
-                        consumed
-                    };
-                    if let Some(frame) = maybe_frame {
-                        frames.push(frame);
-                    }
-                    offset += c;
-                }
+        // Lock the mutex
+        if let Ok(mut rx) = self.frame_rx.lock() {
+            // Drain all currently available frames
+            while let Ok(frame) = rx.try_recv() {
+                frames.push(frame);
             }
+        } else {
+            eprintln!("read_frames: failed to lock frame_rx");
         }
 
-        if offset > 0 {
-            self.rx_leftover.drain(..offset);
-        }
         Ok(frames)
     }
 
