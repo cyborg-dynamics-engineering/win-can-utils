@@ -543,8 +543,16 @@ version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c8469b4a23b962c1396b9b451dda50ef5b283e8dd309d69033475fa9b334324"
 dependencies = [
- "libc",
- "pkg-config",
+    "libc",
+    "pkg-config",
+]
+
+[[package]]
+name = "libusb-async"
+version = "0.1.0"
+dependencies = [
+    "rusb",
+    "tokio",
 ]
 
 [[package]]
@@ -1251,7 +1259,7 @@ dependencies = [
  "named_pipe",
  "peak-can-sys",
  "ringbuf",
- "rusb",
+ "libusb-async",
  "serde",
  "serialport",
  "tokio",

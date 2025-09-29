@@ -1,15 +1,13 @@
 use async_trait::async_trait;
 use crosscan::can::CanFrame;
-use rusb::{
-    self, Device, DeviceDescriptor, DeviceHandle, Direction, GlobalContext, Recipient, RequestType,
+use libusb_async::{
+    self as usb, Device, DeviceDescriptor, DeviceHandle, Direction, Recipient, RequestType,
     TransferType,
 };
 use std::cmp::min;
 use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::task;
 
 use crate::can_driver::CanDriver;
 
@@ -48,17 +46,12 @@ struct InterfaceInfo {
     int_ep: Option<u8>,
 }
 
-fn map_usb_err(err: rusb::Error) -> io::Error {
-    match err {
-        rusb::Error::Timeout => io::Error::new(io::ErrorKind::WouldBlock, err),
-        rusb::Error::Pipe => io::Error::new(io::ErrorKind::BrokenPipe, err),
-        rusb::Error::NoDevice => io::Error::new(io::ErrorKind::NotConnected, err),
-        other => io::Error::new(io::ErrorKind::Other, other),
-    }
+fn map_usb_err(err: usb::UsbAsyncError) -> io::Error {
+    usb::map_usb_err(err)
 }
 
 fn request_type_out() -> u8 {
-    rusb::request_type(Direction::Out, RequestType::Vendor, Recipient::Interface)
+    usb::request_type(Direction::Out, RequestType::Vendor, Recipient::Interface)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -93,10 +86,11 @@ fn host_config_bytes() -> [u8; 4] {
     0x0000_beefu32.to_le_bytes()
 }
 
-fn find_gs_usb_interface(device: &Device<GlobalContext>) -> io::Result<Option<InterfaceInfo>> {
+async fn find_gs_usb_interface(device: &Device) -> io::Result<Option<InterfaceInfo>> {
     let config = device
         .active_config_descriptor()
-        .or_else(|_| device.config_descriptor(0))
+        .await
+        .or_else(|_| device.config_descriptor(0).await)
         .map_err(map_usb_err)?;
 
     for interface in config.interfaces() {
@@ -132,69 +126,62 @@ fn find_gs_usb_interface(device: &Device<GlobalContext>) -> io::Result<Option<In
     Ok(None)
 }
 
-fn device_matches_identifier(
+async fn device_matches_identifier(
     identifier: &str,
     index: usize,
-    device: &Device<GlobalContext>,
+    device: &Device,
     desc: &DeviceDescriptor,
-    handle: &mut DeviceHandle<GlobalContext>,
-) -> bool {
+    handle: &DeviceHandle,
+) -> io::Result<bool> {
     let ident = identifier.trim();
     if ident.eq_ignore_ascii_case("auto") {
-        return true;
+        return Ok(true);
     }
 
     if let Ok(idx) = ident.parse::<usize>() {
         if idx == index {
-            return true;
+            return Ok(true);
         }
     }
 
-    if let Ok(serial) = handle.read_serial_number_string_ascii(desc) {
+    if let Ok(serial) = handle.read_serial_number_string_ascii(desc).await {
         if serial.eq_ignore_ascii_case(ident) {
-            return true;
+            return Ok(true);
         }
     }
 
-    if let Ok(product) = handle.read_product_string_ascii(desc) {
+    if let Ok(product) = handle.read_product_string_ascii(desc).await {
         if product.eq_ignore_ascii_case(ident) {
-            return true;
+            return Ok(true);
         }
     }
 
     let bus_addr = format!("{:03}:{:03}", device.bus_number(), device.address());
-    bus_addr.eq_ignore_ascii_case(ident)
+    Ok(bus_addr.eq_ignore_ascii_case(ident))
 }
 
-fn select_device(
-    identifier: &str,
-) -> io::Result<(DeviceHandle<GlobalContext>, InterfaceInfo, String)> {
-    let devices = rusb::devices().map_err(map_usb_err)?;
+async fn select_device(identifier: &str) -> io::Result<(DeviceHandle, InterfaceInfo, String)> {
+    let devices = usb::devices().await.map_err(map_usb_err)?;
     let mut index = 0usize;
 
     for device in devices.iter() {
-        let desc = match device.device_descriptor() {
-            Ok(d) => d,
-            Err(e) => return Err(map_usb_err(e)),
-        };
+        let desc = device.device_descriptor().await.map_err(map_usb_err)?;
 
-        let info = match find_gs_usb_interface(&device)? {
+        let info = match find_gs_usb_interface(device).await? {
             Some(i) => i,
             None => continue,
         };
 
-        let mut handle = match device.open() {
-            Ok(h) => h,
-            Err(e) => return Err(map_usb_err(e)),
-        };
+        let handle = device.open().await.map_err(map_usb_err)?;
 
-        let matches = device_matches_identifier(identifier, index, &device, &desc, &mut handle);
+        let matches = device_matches_identifier(identifier, index, device, &desc, &handle).await?;
 
         if matches {
             let label = handle
                 .read_product_string_ascii(&desc)
+                .await
                 .ok()
-                .or_else(|| handle.read_serial_number_string_ascii(&desc).ok())
+                .or_else(|| handle.read_serial_number_string_ascii(&desc).await.ok())
                 .unwrap_or_else(|| format!("{:04x}:{:04x}", desc.vendor_id(), desc.product_id()));
             return Ok((handle, info, label));
         }
@@ -339,7 +326,7 @@ fn parse_host_frame(bytes: &[u8], channel_index: u8) -> Option<CanFrame> {
 
 /// Driver for devices implementing the gs_usb protocol (e.g. candleLight / CANable).
 pub struct GsUsbDriver {
-    handle: Arc<Mutex<DeviceHandle<GlobalContext>>>,
+    handle: DeviceHandle,
     interface: u8,
     in_ep: u8,
     out_ep: u8,
@@ -355,15 +342,17 @@ pub struct GsUsbDriver {
 }
 
 impl GsUsbDriver {
-    fn open_sync(identifier: &str) -> io::Result<Self> {
-        let (mut handle, info, label) = select_device(identifier)?;
+    pub async fn open(identifier: &str) -> io::Result<Self> {
+        let (handle, info, label) = select_device(identifier).await?;
 
-        let _ = handle.set_auto_detach_kernel_driver(true);
+        let _ = handle.set_auto_detach_kernel_driver(true).await;
 
-        handle
-            .claim_interface(info.interface)
-            .or_else(|_| handle.claim_interface(info.interface))
-            .map_err(map_usb_err)?;
+        if handle.claim_interface(info.interface).await.is_err() {
+            handle
+                .claim_interface(info.interface)
+                .await
+                .map_err(map_usb_err)?;
+        }
 
         let req_type = request_type_out();
         let host_cfg = host_config_bytes();
@@ -376,6 +365,7 @@ impl GsUsbDriver {
                 &host_cfg,
                 USB_TIMEOUT,
             )
+            .await
             .map_err(map_usb_err)?;
         if written != host_cfg.len() {
             return Err(io::Error::new(
@@ -385,7 +375,7 @@ impl GsUsbDriver {
         }
 
         let mut driver = GsUsbDriver {
-            handle: Arc::new(Mutex::new(handle)),
+            handle,
             interface: info.interface,
             in_ep: info.in_ep,
             out_ep: info.out_ep,
@@ -399,19 +389,19 @@ impl GsUsbDriver {
             last_timestamp64: None,
         };
 
-        // Reset device into known state.
         let reset_bytes = encode_mode(GS_CAN_MODE_RESET, 0);
-        driver.send_control_sync(GS_USB_BREQ_MODE, &reset_bytes)?;
+        driver.send_control(GS_USB_BREQ_MODE, &reset_bytes).await?;
 
         Ok(driver)
     }
 
-    fn send_control_sync(&mut self, request: u8, data: &[u8]) -> io::Result<()> {
-        let mut handle = self
+    pub fn device_label(&self) -> &str {
+        &self.device_label
+    }
+
+    async fn send_control(&self, request: u8, data: &[u8]) -> io::Result<()> {
+        let written = self
             .handle
-            .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "USB handle mutex poisoned"))?;
-        let written = handle
             .write_control(
                 request_type_out(),
                 request,
@@ -420,6 +410,7 @@ impl GsUsbDriver {
                 data,
                 USB_TIMEOUT,
             )
+            .await
             .map_err(map_usb_err)?;
         if written != data.len() {
             return Err(io::Error::new(
@@ -428,60 +419,6 @@ impl GsUsbDriver {
             ));
         }
         Ok(())
-    }
-
-    async fn with_handle<T, F>(&self, f: F) -> io::Result<T>
-    where
-        T: Send + 'static,
-        F: FnOnce(&mut DeviceHandle<GlobalContext>) -> io::Result<T> + Send + 'static,
-    {
-        let handle = self.handle.clone();
-        task::spawn_blocking(move || {
-            let mut guard = handle
-                .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "USB handle mutex poisoned"))?;
-            f(&mut guard)
-        })
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("USB task join error: {e}")))?
-    }
-
-    pub async fn open(identifier: &str) -> io::Result<Self> {
-        let id = identifier.to_string();
-        task::spawn_blocking(move || Self::open_sync(&id))
-            .await
-            .map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("USB task join error: {e}"))
-            })?
-    }
-
-    pub fn device_label(&self) -> &str {
-        &self.device_label
-    }
-
-    async fn send_control(&self, request: u8, data: &[u8]) -> io::Result<()> {
-        let interface = self.interface;
-        let data = data.to_vec();
-        self.with_handle(move |handle| {
-            let written = handle
-                .write_control(
-                    request_type_out(),
-                    request,
-                    0,
-                    interface as u16,
-                    &data,
-                    USB_TIMEOUT,
-                )
-                .map_err(map_usb_err)?;
-            if written != data.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Incomplete control transfer to gs_usb device",
-                ));
-            }
-            Ok(())
-        })
-        .await
     }
 }
 
@@ -553,61 +490,66 @@ impl CanDriver for GsUsbDriver {
         let data_len = std::cmp::min(frame.data().len(), 64);
         buffer[16..16 + data_len].copy_from_slice(&frame.data()[..data_len]);
 
-        let out_ep = self.out_ep;
-        self.with_handle(move |handle| {
-            let written = handle
-                .write_bulk(out_ep, &buffer, USB_TIMEOUT)
-                .map_err(map_usb_err)?;
-            if written != HOST_FRAME_SIZE {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Incomplete bulk transfer when sending CAN frame",
-                ));
-            }
-            Ok(())
-        })
-        .await
+        let written = self
+            .handle
+            .write_bulk(self.out_ep, &buffer, USB_TIMEOUT)
+            .await
+            .map_err(map_usb_err)?;
+        if written != HOST_FRAME_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Incomplete bulk transfer when sending CAN frame",
+            ));
+        }
+        Ok(())
     }
 
     async fn read_frames(&mut self) -> io::Result<Vec<CanFrame>> {
-        let in_ep = self.in_ep;
+        let mut tmp = vec![0u8; HOST_FRAME_SIZE * READ_CHUNK_FRAMES];
+        let mut data = Vec::with_capacity(tmp.len() * 2);
 
-        // Drain as much as we can in one blocking section to avoid per-call overhead.
-        let mut data = self
-            .with_handle(move |handle| {
-                // One big reusable chunk per read.
-                let mut tmp = vec![0u8; HOST_FRAME_SIZE * READ_CHUNK_FRAMES];
-                let mut out = Vec::with_capacity(tmp.len() * 2);
-
-                // First read with the normal timeout (up to 100ms).
-                match handle.read_bulk(in_ep, &mut tmp, USB_TIMEOUT) {
-                    Ok(n) if n > 0 => out.extend_from_slice(&tmp[..n]),
-                    Ok(_) | Err(rusb::Error::Timeout) => return Ok(Vec::new()),
-                    Err(e) => return Err(map_usb_err(e)),
+        match self
+            .handle
+            .read_bulk(self.in_ep, &mut tmp, USB_TIMEOUT)
+            .await
+        {
+            Ok(n) if n > 0 => data.extend_from_slice(&tmp[..n]),
+            Ok(_) => return Ok(Vec::new()),
+            Err(err) => {
+                let io_err = map_usb_err(err);
+                if io_err.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(Vec::new());
                 }
+                return Err(io_err);
+            }
+        }
 
-                // Quickly drain anything queued using a tiny timeout, until we get a short read or timeout.
-                loop {
-                    match handle.read_bulk(in_ep, &mut tmp, DRAIN_READ_TIMEOUT) {
-                        Ok(n) if n > 0 => {
-                            out.extend_from_slice(&tmp[..n]);
-                            // Heuristic: if the device returned less than our chunk, likely drained.
-                            if n < tmp.len() {
-                                break;
-                            }
-                        }
-                        Ok(_) | Err(rusb::Error::Timeout) => break,
-                        Err(rusb::Error::Pipe) => {
-                            // Recoverable: clear halt and stop draining this cycle.
-                            let _ = handle.clear_halt(in_ep);
-                            break;
-                        }
-                        Err(e) => return Err(map_usb_err(e)),
+        loop {
+            match self
+                .handle
+                .read_bulk(self.in_ep, &mut tmp, DRAIN_READ_TIMEOUT)
+                .await
+            {
+                Ok(n) if n > 0 => {
+                    data.extend_from_slice(&tmp[..n]);
+                    if n < tmp.len() {
+                        break;
                     }
                 }
-                Ok(out)
-            })
-            .await?;
+                Ok(_) => break,
+                Err(err) => {
+                    let io_err = map_usb_err(err);
+                    match io_err.kind() {
+                        io::ErrorKind::WouldBlock => break,
+                        io::ErrorKind::BrokenPipe => {
+                            let _ = self.handle.clear_halt(self.in_ep).await;
+                            break;
+                        }
+                        _ => return Err(io_err),
+                    }
+                }
+            }
+        }
 
         if data.is_empty() {
             return Ok(Vec::new());
