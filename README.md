@@ -19,7 +19,35 @@ This project aims to provide a Windows equivalent of [can-utils](https://github.
 
 
 ## Installation
-Download & run the latest .msi installer from [Releases](https://github.com/Cyborg-Dynamics-Engineering/win-can-utils/releases)
+
+1. Download the latest `.msi` installer from the
+   [Releases](https://github.com/Cyborg-Dynamics-Engineering/win-can-utils/releases) page.
+2. Run the installer and follow the on-screen prompts to complete setup.
+3. Install the `PCANBasic.dll` runtime dependency (see
+   [PCAN-Basic dependency](#pcan-basic-dependency)).
+
+> **Tip:** Administrative privileges are recommended for installing both the
+> application and the supporting drivers.
+
+## PCAN-Basic dependency
+
+Some CAN adapters require the
+[PCAN-Basic API](https://www.peak-system.com/PCAN-Basic.239.0.html?&L=1)
+runtime library to be present on the system. To install the dependency:
+
+1. Download the latest PCAN-Basic package from PEAK-System.
+2. Review and accept the PEAK-System PCAN-Basic End User License Agreement
+   (EULA) during installation. Installation and use of `PCANBasic.dll`
+   indicates that you agree to the terms of the EULA; ensure that your use
+   complies with all PEAK-System licensing requirements.
+3. Extract `PCANBasic.dll` from the package and copy it into the same
+   directory as the Windows CAN Utils executables (or another directory on the
+   system `PATH`).
+4. Restart any running Windows CAN Utils processes to ensure the new DLL is
+   loaded.
+
+You only need to perform these steps once per machine, unless you remove or
+update the DLL in the future.
 
 ## Usage
 ### CAN Server
