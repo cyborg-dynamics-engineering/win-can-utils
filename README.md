@@ -28,6 +28,12 @@ To find the adapter, open 'Device Manager' and look in the 'Ports (COM & LPT)' d
 ```
 Usage: canserver <driver> <port> [--bitrate <bitrate>]
 Example: canserver slcan COM5 --bitrate 1000000
+
+Supported drivers:
+
+- `slcan` for serial-line CAN adapters.
+- `pcan` for Peak PCAN-USB/PCI/LAN adapters.
+- `gsusb` for CANable/candleLight style USB adapters using the gs_usb protocol.
 ```
 
 ### CAN Dump
