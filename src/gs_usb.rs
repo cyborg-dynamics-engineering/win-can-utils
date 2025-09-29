@@ -486,6 +486,36 @@ impl LibusbDeviceHandle {
             )),
         }
     }
+
+    fn bulk_read_blocking(
+        &self,
+        endpoint: u8,
+        length: usize,
+        timeout: Duration,
+    ) -> io::Result<Vec<u8>> {
+        eprintln!(
+            "[usb] bulk_read_blocking: submitting read of {length} bytes with timeout {timeout:?}"
+        );
+        let mut buffer = vec![0u8; length];
+        let mut transferred: c_int = 0;
+        let rc = unsafe {
+            libusb::libusb_bulk_transfer(
+                self.handle.0,
+                endpoint,
+                buffer.as_mut_ptr(),
+                length as c_int,
+                &mut transferred,
+                duration_to_timeout(timeout) as c_uint,
+            )
+        };
+        if rc < 0 {
+            eprintln!("[usb] bulk_read_blocking error: rc={rc}");
+            return Err(map_libusb_error(rc));
+        }
+        eprintln!("[usb] bulk_read_blocking got {transferred} bytes");
+        buffer.truncate(transferred as usize);
+        Ok(buffer)
+    }
 }
 
 struct BulkWriteState {
@@ -537,6 +567,7 @@ extern "system" fn bulk_read_callback(transfer: *mut libusb::libusb_transfer) {
                 ))
             }
         } else {
+            eprintln!("[usb] bulk_read_callback error: {:?}", status);
             Err(map_transfer_status(status))
         };
         if let Some(sender) = state.sender.take() {
@@ -937,7 +968,12 @@ fn parse_host_frame_at(
 
     // Skip echoes / wrong channels
     if echo_id != GS_CAN_ECHO_ID_UNUSED || chan != channel_index {
-        return Some((None, total_len));
+        eprintln!(
+            "[parser][candidate drop] echo_id={:#x}, chan={}, raw_id={:#x}, dlc={}",
+            echo_id, chan, raw_id, dlc
+        );
+        // Comment out the return to see if you get valid frames
+        // return Some((None, total_len));
     }
 
     let ts_off = GS_HEADER_LEN;
@@ -1033,29 +1069,88 @@ impl GsUsbDriver {
 
         // Spawn background reader
         let mut bg_driver = driver.clone_for_reader();
-        tokio::spawn(async move {
+        let handle_clone = driver.handle.clone();
+        let in_ep = driver.in_ep;
+        let frame_tx = tx.clone();
+        let mut bg_driver = driver.clone_for_reader();
+
+        std::thread::spawn(move || {
+            eprintln!("[blocking reader] thread started, in_ep={:#x}", in_ep);
+
             loop {
-                eprintln!("[bg] submitting read_frames_once"); // keep if you want occasional traces
-                match bg_driver.read_frames_once().await {
-                    Ok(frames) => {
-                        if !frames.is_empty() {
-                            eprintln!("[bg] got {} frames", frames.len());
+                match handle_clone.bulk_read_blocking(in_ep, USB_READ_BYTES, USB_TIMEOUT) {
+                    Ok(chunk) if !chunk.is_empty() => {
+                        eprintln!("[blocking reader] got {} bytes", chunk.len());
+                        bg_driver.rx_leftover.extend_from_slice(&chunk);
+
+                        // Debug leftover growth
+                        if bg_driver.rx_leftover.len() > GS_MAX_FRAME_LEN * 2 {
+                            eprintln!(
+                                "[blocking reader][warn] leftover buffer = {} bytes",
+                                bg_driver.rx_leftover.len()
+                            );
                         }
-                        for f in frames {
-                            if tx.send(f).await.is_err() {
-                                return; // receiver dropped
+
+                        let mut offset = 0;
+                        while bg_driver.rx_leftover.len() >= offset + 20 {
+                            let slice = &bg_driver.rx_leftover[offset..];
+
+                            // Only try parse if we definitely have 20+ bytes
+                            match parse_host_frame_at(
+                                slice,
+                                bg_driver.channel_index,
+                                bg_driver.timestamp_enabled,
+                                &mut bg_driver.last_timestamp64,
+                            ) {
+                                None => {
+                                    // can't parse → drop one byte to resync
+                                    offset += 1;
+                                    continue;
+                                }
+                                Some((maybe_frame, consumed)) => {
+                                    // sanity check: only accept full frame lengths
+                                    if consumed < 20 || consumed > GS_MAX_FRAME_LEN {
+                                        offset += 1; // bad parse, resync
+                                        continue;
+                                    }
+
+                                    if let Some(frame) = maybe_frame {
+                                        eprintln!(
+                                            "[parser] decoded frame: id=0x{:x}, dlc={}, data={:x?}",
+                                            frame.id(),
+                                            frame.dlc(),
+                                            frame.data()
+                                        );
+                                        if frame_tx.blocking_send(frame).is_err() {
+                                            return;
+                                        }
+                                    }
+                                    offset += consumed;
+                                }
                             }
                         }
+
+                        if offset > 0 {
+                            eprintln!(
+                                "[blocking reader] consumed {offset} bytes, leftover={}",
+                                bg_driver.rx_leftover.len().saturating_sub(offset)
+                            );
+                            bg_driver.rx_leftover.drain(..offset);
+                        }
+                    }
+                    Ok(_) => {
+                        eprintln!("[blocking reader] got empty chunk");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        eprintln!("[blocking reader] timeout, no data");
+                        std::thread::sleep(Duration::from_millis(1));
                     }
                     Err(err) => {
-                        eprintln!("[background reader] error: {err}");
+                        eprintln!("[blocking reader][error] {:?}", err);
                         return;
                     }
                 }
-
-                // 🔑 Add this: prevents tight-loop CPU hogging when no frames arrive
-                tokio::task::yield_now().await;
-                // or: tokio::time::sleep(Duration::from_millis(1)).await;
             }
         });
 
