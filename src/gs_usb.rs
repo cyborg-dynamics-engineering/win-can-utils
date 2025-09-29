@@ -493,9 +493,6 @@ impl LibusbDeviceHandle {
         length: usize,
         timeout: Duration,
     ) -> io::Result<Vec<u8>> {
-        eprintln!(
-            "[usb] bulk_read_blocking: submitting read of {length} bytes with timeout {timeout:?}"
-        );
         let mut buffer = vec![0u8; length];
         let mut transferred: c_int = 0;
         let rc = unsafe {
@@ -512,7 +509,6 @@ impl LibusbDeviceHandle {
             eprintln!("[usb] bulk_read_blocking error: rc={rc}");
             return Err(map_libusb_error(rc));
         }
-        eprintln!("[usb] bulk_read_blocking got {transferred} bytes");
         buffer.truncate(transferred as usize);
         Ok(buffer)
     }
@@ -918,73 +914,45 @@ fn plausible_header(hdr: &[u8], expected_chan: u8) -> bool {
     len <= GS_MAX_DATA && chan == expected_chan
 }
 
-/// Parses one frame starting at bytes[0], returns (maybe_frame, consumed_len).
 fn parse_host_frame_at(
     bytes: &[u8],
     channel_index: u8,
-    _timestamp_enabled: bool,
-    last_ts64: &mut Option<u64>,
+    _timestamp_enabled: bool,     // ignored
+    _last_ts64: &mut Option<u64>, // ignored
 ) -> Option<(Option<CanFrame>, usize)> {
     if bytes.len() < GS_HEADER_LEN {
-        return None;
+        return None; // not enough for a header
+    }
+
+    // Quick plausibility check
+    if !plausible_header(bytes, channel_index) {
+        return Some((None, 1)); // skip one byte to resync
     }
 
     let echo_id = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
     let raw_id = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
     let dlc = bytes[8];
     let chan = bytes[9];
-
     let data_len = dlc_to_len(dlc);
-    if data_len > GS_MAX_DATA {
-        return Some((None, 1)); // malformed dlc → resync
+
+    let total_len = GS_HEADER_LEN + data_len;
+    if total_len > GS_MAX_FRAME_LEN {
+        return Some((None, 1)); // nonsense → skip 1 byte
+    }
+    if bytes.len() < total_len {
+        return None; // need more data
     }
 
-    let len_no_ts = GS_HEADER_LEN + data_len;
-    let len_with_ts = GS_HEADER_LEN + GS_TS_LEN + data_len;
-
-    let mut use_ts = false;
-    if bytes.len() >= len_with_ts + GS_HEADER_LEN {
-        let next_hdr = &bytes[len_with_ts..len_with_ts + GS_HEADER_LEN];
-        if plausible_header(next_hdr, channel_index) {
-            use_ts = true;
-        }
-    }
-
-    let total_len = if use_ts {
-        if bytes.len() < len_with_ts {
-            return None;
-        }
-        len_with_ts
-    } else {
-        if bytes.len() < len_no_ts {
-            return None;
-        }
-        len_no_ts
-    };
-
-    if total_len == 0 || total_len > GS_MAX_FRAME_LEN {
-        return Some((None, 1));
-    }
-
-    // Skip echoes / wrong channels
-    if echo_id != GS_CAN_ECHO_ID_UNUSED || chan != channel_index {
-        eprintln!(
-            "[parser][candidate drop] echo_id={:#x}, chan={}, raw_id={:#x}, dlc={}",
-            echo_id, chan, raw_id, dlc
-        );
-        // Comment out the return to see if you get valid frames
-        // return Some((None, total_len));
-    }
-
-    let ts_off = GS_HEADER_LEN;
-    let data_off = if use_ts {
-        GS_HEADER_LEN + GS_TS_LEN
-    } else {
-        GS_HEADER_LEN
-    };
+    let data_off = GS_HEADER_LEN;
     let data = &bytes[data_off..data_off + data_len];
 
-    let mut frame = if (raw_id & CAN_ERR_FLAG) != 0 {
+    // Skip echoes or other channels
+    if echo_id != GS_CAN_ECHO_ID_UNUSED || chan != channel_index {
+        return Some((None, total_len));
+    }
+
+    // Build frame
+    let frame = if (raw_id & CAN_ERR_FLAG) != 0 {
         CanFrame::new_error(raw_id & CAN_ERR_MASK).ok()?
     } else if (raw_id & CAN_RTR_FLAG) != 0 {
         CanFrame::new_remote(
@@ -1003,23 +971,6 @@ fn parse_host_frame_at(
     } else {
         CanFrame::new(raw_id & CAN_SFF_MASK, data).ok()?
     };
-
-    if use_ts {
-        let ts32 = u32::from_le_bytes(bytes[ts_off..ts_off + 4].try_into().unwrap()) as u64;
-        let ts64 = match *last_ts64 {
-            None => ts32,
-            Some(last) => {
-                let base = last & !0xFFFF_FFFFu64;
-                let mut candidate = base | ts32;
-                if candidate < last {
-                    candidate = candidate.wrapping_add(1u64 << 32);
-                }
-                candidate
-            }
-        };
-        *last_ts64 = Some(ts64);
-        frame.set_timestamp(Some(ts64));
-    }
 
     Some((Some(frame), total_len))
 }
@@ -1080,7 +1031,6 @@ impl GsUsbDriver {
             loop {
                 match handle_clone.bulk_read_blocking(in_ep, USB_READ_BYTES, USB_TIMEOUT) {
                     Ok(chunk) if !chunk.is_empty() => {
-                        eprintln!("[blocking reader] got {} bytes", chunk.len());
                         bg_driver.rx_leftover.extend_from_slice(&chunk);
 
                         // Debug leftover growth
@@ -1092,35 +1042,17 @@ impl GsUsbDriver {
                         }
 
                         let mut offset = 0;
-                        while bg_driver.rx_leftover.len() >= offset + 20 {
+                        while bg_driver.rx_leftover.len() >= offset + GS_HEADER_LEN {
                             let slice = &bg_driver.rx_leftover[offset..];
-
-                            // Only try parse if we definitely have 20+ bytes
                             match parse_host_frame_at(
                                 slice,
                                 bg_driver.channel_index,
                                 bg_driver.timestamp_enabled,
                                 &mut bg_driver.last_timestamp64,
                             ) {
-                                None => {
-                                    // can't parse → drop one byte to resync
-                                    offset += 1;
-                                    continue;
-                                }
+                                None => break, // need more data
                                 Some((maybe_frame, consumed)) => {
-                                    // sanity check: only accept full frame lengths
-                                    if consumed < 20 || consumed > GS_MAX_FRAME_LEN {
-                                        offset += 1; // bad parse, resync
-                                        continue;
-                                    }
-
                                     if let Some(frame) = maybe_frame {
-                                        eprintln!(
-                                            "[parser] decoded frame: id=0x{:x}, dlc={}, data={:x?}",
-                                            frame.id(),
-                                            frame.dlc(),
-                                            frame.data()
-                                        );
                                         if frame_tx.blocking_send(frame).is_err() {
                                             return;
                                         }
@@ -1129,12 +1061,7 @@ impl GsUsbDriver {
                                 }
                             }
                         }
-
                         if offset > 0 {
-                            eprintln!(
-                                "[blocking reader] consumed {offset} bytes, leftover={}",
-                                bg_driver.rx_leftover.len().saturating_sub(offset)
-                            );
                             bg_driver.rx_leftover.drain(..offset);
                         }
                     }
@@ -1200,88 +1127,88 @@ impl GsUsbDriver {
         Ok(())
     }
 
-    async fn read_frames_once(&mut self) -> io::Result<Vec<CanFrame>> {
-        let mut first = true;
+    // async fn read_frames_once(&mut self) -> io::Result<Vec<CanFrame>> {
+    //     let mut first = true;
 
-        loop {
-            let timeout = if first {
-                USB_TIMEOUT
-            } else {
-                DRAIN_READ_TIMEOUT
-            };
+    //     loop {
+    //         let timeout = if first {
+    //             USB_TIMEOUT
+    //         } else {
+    //             DRAIN_READ_TIMEOUT
+    //         };
 
-            let chunk = match self
-                .handle
-                .bulk_read(self.in_ep, USB_READ_BYTES, timeout)
-                .await
-            {
-                Ok(chunk) => chunk,
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    // no data available right now, stop this iteration
-                    break;
-                }
-                Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {
-                    let _ = self.handle.clear_halt(self.in_ep);
-                    break;
-                }
-                Err(err) => return Err(err),
-            };
+    //         let chunk = match self
+    //             .handle
+    //             .bulk_read(self.in_ep, USB_READ_BYTES, timeout)
+    //             .await
+    //         {
+    //             Ok(chunk) => chunk,
+    //             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+    //                 // no data available right now, stop this iteration
+    //                 break;
+    //             }
+    //             Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {
+    //                 let _ = self.handle.clear_halt(self.in_ep);
+    //                 break;
+    //             }
+    //             Err(err) => return Err(err),
+    //         };
 
-            if chunk.is_empty() {
-                // don’t exit permanently, just keep polling next iteration
-                continue;
-            }
+    //         if chunk.is_empty() {
+    //             // don’t exit permanently, just keep polling next iteration
+    //             continue;
+    //         }
 
-            // eprintln!("[bg] bulk_read got {} bytes", chunk.len());
-            self.rx_leftover.extend_from_slice(&chunk);
-            first = false;
+    //         // eprintln!("[bg] bulk_read got {} bytes", chunk.len());
+    //         self.rx_leftover.extend_from_slice(&chunk);
+    //         first = false;
 
-            // Heuristic: short read means likely drained the device queue
-            if chunk.len() < USB_READ_BYTES {
-                break;
-            }
-        }
+    //         // Heuristic: short read means likely drained the device queue
+    //         if chunk.len() < USB_READ_BYTES {
+    //             break;
+    //         }
+    //     }
 
-        let mut frames = Vec::new();
-        let mut offset = 0usize;
+    //     let mut frames = Vec::new();
+    //     let mut offset = 0usize;
 
-        while self.rx_leftover.len() >= offset + GS_HEADER_LEN {
-            let slice = &self.rx_leftover[offset..];
-            match parse_host_frame_at(
-                slice,
-                self.channel_index,
-                self.timestamp_enabled,
-                &mut self.last_timestamp64,
-            ) {
-                None => {
-                    // instead of breaking, advance by one to resync
-                    offset += 1;
-                    continue;
-                }
-                Some((maybe_frame, consumed)) => {
-                    let c = if consumed == 0 || consumed > GS_MAX_FRAME_LEN {
-                        1
-                    } else {
-                        consumed
-                    };
-                    if let Some(frame) = maybe_frame {
-                        // eprintln!("[bg] decoded frame: {:?}", frame);
-                        frames.push(frame);
-                    }
-                    offset += c;
-                }
-            }
-        }
+    //     while self.rx_leftover.len() >= offset + GS_HEADER_LEN {
+    //         let slice = &self.rx_leftover[offset..];
+    //         match parse_host_frame_at(
+    //             slice,
+    //             self.channel_index,
+    //             self.timestamp_enabled,
+    //             &mut self.last_timestamp64,
+    //         ) {
+    //             None => {
+    //                 // instead of breaking, advance by one to resync
+    //                 offset += 1;
+    //                 continue;
+    //             }
+    //             Some((maybe_frame, consumed)) => {
+    //                 let c = if consumed == 0 || consumed > GS_MAX_FRAME_LEN {
+    //                     1
+    //                 } else {
+    //                     consumed
+    //                 };
+    //                 if let Some(frame) = maybe_frame {
+    //                     // eprintln!("[bg] decoded frame: {:?}", frame);
+    //                     frames.push(frame);
+    //                 }
+    //                 offset += c;
+    //             }
+    //         }
+    //     }
 
-        if offset > 0 {
-            self.rx_leftover.drain(..offset);
-        }
+    //     if offset > 0 {
+    //         self.rx_leftover.drain(..offset);
+    //     }
 
-        // Prevent starving the event loop
-        tokio::task::yield_now().await;
+    //     // Prevent starving the event loop
+    //     tokio::task::yield_now().await;
 
-        Ok(frames)
-    }
+    //     Ok(frames)
+    // }
 }
 
 #[async_trait]
@@ -1322,7 +1249,12 @@ impl CanDriver for GsUsbDriver {
     async fn send_frame(&mut self, frame: &CanFrame) -> io::Result<()> {
         let mut buffer = vec![0u8; HOST_FRAME_SIZE];
 
-        let mut can_id = frame.id();
+        // --- Correct CAN ID handling ---
+        let mut can_id = if frame.is_extended() {
+            frame.id() & CAN_EFF_MASK
+        } else {
+            frame.id() & CAN_SFF_MASK
+        };
         if frame.is_extended() {
             can_id |= CAN_EFF_FLAG;
         }
@@ -1336,13 +1268,20 @@ impl CanDriver for GsUsbDriver {
 
         buffer[8] = frame.dlc() as u8;
         buffer[9] = self.channel_index;
-        buffer[10] = 0;
-        buffer[11] = 0;
-        buffer[12..16].fill(0);
+        buffer[10] = 0; // flags
+        buffer[11] = 0; // reserved
 
+        // --- Timestamp reserved only if enabled ---
+        let mut data_off = GS_HEADER_LEN;
+        if self.timestamp_enabled {
+            buffer[12..16].fill(0); // placeholder timestamp
+            data_off += GS_TS_LEN;
+        }
+
+        // --- Copy data correctly aligned ---
         let frame_data = frame.data();
         let data_len = frame_data.len().min(64);
-        buffer[16..16 + data_len].copy_from_slice(&frame_data[..data_len]);
+        buffer[data_off..data_off + data_len].copy_from_slice(&frame_data[..data_len]);
 
         let written = self
             .handle
