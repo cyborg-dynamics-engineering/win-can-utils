@@ -2,7 +2,7 @@ use bincode;
 use clap::Parser;
 use crosscan::can::CanFrame;
 use std::process::exit;
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -175,8 +175,6 @@ async fn main() -> std::io::Result<()> {
             exit(1);
         }
     };
-
-    let shutdown = Arc::new(AtomicBool::new(false));
 
     let (tx_out_pipe, rx_out_pipe) = mpsc::channel::<Vec<u8>>(100);
     let (tx_in_pipe, mut rx_in_pipe) = mpsc::channel::<Vec<u8>>(100);

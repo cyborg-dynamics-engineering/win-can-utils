@@ -1,10 +1,9 @@
-use async_trait::async_trait;
-use bincode::enc::write;
 /// Provides the SlcanDriver that exposes a serial port as a CAN interface.
+use async_trait::async_trait;
 use crosscan::can::CanFrame;
 use memchr::memchr;
 use std::time::Duration;
-use tokio::io::{split, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, split};
 use tokio::sync::Mutex;
 use tokio_serial::SerialStream;
 
@@ -29,7 +28,7 @@ impl SlcanDriver {
         Ok(SlcanDriver {
             reader: Mutex::new(reader),
             writer: Mutex::new(writer),
-            leftover: Vec::with_capacity(4096),
+            leftover: Vec::with_capacity(8192),
             timestamp_high: 0,
             configured_bitrate: None,
         })
@@ -143,10 +142,13 @@ impl SlcanDriver {
             }
 
             // Await instead of busy-looping
-            let mut reader = self.reader.lock().await;
-            let n = reader.read(&mut buf[received..]).await?;
-            if n > 0 {
-                received += n;
+            let num_bytes = {
+                let mut reader = self.reader.lock().await;
+                reader.read(&mut buf[received..]).await?
+            };
+
+            if num_bytes > 0 {
+                received += num_bytes;
             } else {
                 // yield briefly
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -154,7 +156,6 @@ impl SlcanDriver {
         }
 
         let actual = u32::from_le_bytes(buf);
-
         if actual < 5000 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -259,20 +260,19 @@ impl CanDriver for SlcanDriver {
     }
 
     async fn read_frames(&mut self) -> std::io::Result<Vec<CanFrame>> {
-        let mut buf = [0u8; 1024];
+        let mut buf = [0u8; 4096];
         let mut frames = Vec::new();
 
-        // Scope the MutexGuard
-        {
+        let num_bytes = {
             let mut reader = self.reader.lock().await;
-            let n = reader.read(&mut buf).await?;
-            if n > 0 {
-                self.leftover.extend_from_slice(&buf[..n]);
-            }
+            reader.read(&mut buf).await?
+        };
+
+        if num_bytes > 0 {
+            self.leftover.extend_from_slice(&buf[..num_bytes]);
         }
 
         let mut processed = 0;
-
         while let Some(relative_pos) = memchr(b'\r', &self.leftover[processed..]) {
             let end = processed + relative_pos + 1;
             let line = &self.leftover[processed..end];
