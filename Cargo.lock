@@ -1196,6 +1196,7 @@ dependencies = [
  "crosscan",
  "ctrlc",
  "futures",
+ "memchr",
  "mpsc",
  "named_pipe",
  "peak-can-sys",
