@@ -1,22 +1,33 @@
 use async_trait::async_trait;
 use crosscan::can::CanFrame;
-use rusb::{
-    self, Device, DeviceDescriptor, DeviceHandle, Direction, GlobalContext, Recipient, RequestType,
-    TransferType,
+use libc::timeval;
+use libusb1_sys as libusb;
+use libusb1_sys::constants::{
+    LIBUSB_CONTROL_SETUP_SIZE, LIBUSB_ENDPOINT_IN, LIBUSB_ENDPOINT_OUT, LIBUSB_ERROR_INTERRUPTED,
+    LIBUSB_ERROR_NO_DEVICE, LIBUSB_ERROR_NOT_FOUND, LIBUSB_ERROR_NOT_SUPPORTED, LIBUSB_ERROR_PIPE,
+    LIBUSB_ERROR_TIMEOUT, LIBUSB_RECIPIENT_INTERFACE, LIBUSB_REQUEST_TYPE_VENDOR,
+    LIBUSB_TRANSFER_CANCELLED, LIBUSB_TRANSFER_COMPLETED, LIBUSB_TRANSFER_ERROR,
+    LIBUSB_TRANSFER_NO_DEVICE, LIBUSB_TRANSFER_OVERFLOW, LIBUSB_TRANSFER_STALL,
+    LIBUSB_TRANSFER_TIMED_OUT, LIBUSB_TRANSFER_TYPE_BULK, LIBUSB_TRANSFER_TYPE_CONTROL,
+    LIBUSB_TRANSFER_TYPE_INTERRUPT,
 };
 use std::cmp::min;
-use std::io;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::ffi::CStr;
+use std::mem::MaybeUninit;
+use std::os::raw::{c_int, c_uint, c_void};
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
-use tokio::task;
+use std::{io, thread};
+use tokio::sync::oneshot;
 
 use crate::can_driver::CanDriver;
 
-const USB_TIMEOUT: Duration = Duration::from_millis(1);
-// Read tuning: number of frames to attempt per bulk read, and a tiny drain timeout.
+const USB_TIMEOUT: Duration = Duration::from_millis(25);
 const READ_CHUNK_FRAMES: usize = 1024;
-const DRAIN_READ_TIMEOUT: Duration = Duration::from_micros(10);
+const DRAIN_READ_TIMEOUT: Duration = Duration::from_millis(2);
 
 const HOST_FRAME_SIZE: usize = 4 + 4 + 1 + 1 + 1 + 1 + 4 + 64;
 
@@ -29,6 +40,14 @@ const GS_CAN_MODE_START: u32 = 0x0000_0001;
 
 const GS_CAN_ECHO_ID_UNUSED: u32 = 0xFFFF_FFFF;
 
+const GS_HEADER_LEN: usize = 12; // echo_id(4) + can_id(4) + dlc(1)+chan(1)+flags(1)+res(1)
+const GS_TS_LEN: usize = 4; // optional u32 timestamp
+const GS_MAX_DATA: usize = 64; // max CAN(-FD) payload
+const GS_MAX_FRAME_LEN: usize = GS_HEADER_LEN + GS_TS_LEN + GS_MAX_DATA; // 80
+
+// choose a sane USB bulk read size (multiple frames)
+const USB_READ_BYTES: usize = 8 * 1024;
+
 const CAN_EFF_FLAG: u32 = 0x8000_0000;
 const CAN_RTR_FLAG: u32 = 0x4000_0000;
 const CAN_ERR_FLAG: u32 = 0x2000_0000;
@@ -39,7 +58,6 @@ const CAN_ERR_MASK: u32 = 0x1FFF_FFFF;
 const TARGET_SAMPLE_POINT: f64 = 0.875;
 const GS_USB_MAX_ECHO_SLOTS: u32 = 64;
 
-/// Information about the bulk endpoints exposed by the gs_usb interface.
 #[derive(Clone, Copy, Debug)]
 struct InterfaceInfo {
     interface: u8,
@@ -48,17 +66,64 @@ struct InterfaceInfo {
     int_ep: Option<u8>,
 }
 
-fn map_usb_err(err: rusb::Error) -> io::Error {
-    match err {
-        rusb::Error::Timeout => io::Error::new(io::ErrorKind::WouldBlock, err),
-        rusb::Error::Pipe => io::Error::new(io::ErrorKind::BrokenPipe, err),
-        rusb::Error::NoDevice => io::Error::new(io::ErrorKind::NotConnected, err),
-        other => io::Error::new(io::ErrorKind::Other, other),
+fn libusb_error_string(code: i32) -> String {
+    unsafe {
+        let ptr = libusb::libusb_error_name(code);
+        if ptr.is_null() {
+            format!("libusb error {code}")
+        } else {
+            CStr::from_ptr(ptr).to_string_lossy().into_owned()
+        }
     }
 }
 
+fn map_libusb_error(code: i32) -> io::Error {
+    let kind = match code {
+        LIBUSB_ERROR_TIMEOUT => io::ErrorKind::WouldBlock,
+        LIBUSB_ERROR_PIPE => io::ErrorKind::BrokenPipe,
+        LIBUSB_ERROR_NO_DEVICE => io::ErrorKind::NotConnected,
+        LIBUSB_ERROR_NOT_FOUND => io::ErrorKind::NotFound,
+        LIBUSB_ERROR_INTERRUPTED => io::ErrorKind::Interrupted,
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, libusb_error_string(code))
+}
+
+fn map_transfer_status(status: i32) -> io::Error {
+    let (kind, description) = match status {
+        s if s == LIBUSB_TRANSFER_TIMED_OUT => {
+            (io::ErrorKind::WouldBlock, "libusb transfer timed out")
+        }
+        s if s == LIBUSB_TRANSFER_STALL => (io::ErrorKind::BrokenPipe, "libusb transfer stalled"),
+        s if s == LIBUSB_TRANSFER_NO_DEVICE => {
+            (io::ErrorKind::NotConnected, "libusb device disconnected")
+        }
+        s if s == LIBUSB_TRANSFER_CANCELLED => {
+            (io::ErrorKind::Interrupted, "libusb transfer cancelled")
+        }
+        s if s == LIBUSB_TRANSFER_ERROR => (io::ErrorKind::Other, "libusb transfer error"),
+        s if s == LIBUSB_TRANSFER_OVERFLOW => (io::ErrorKind::Other, "libusb transfer overflow"),
+        _ => (io::ErrorKind::Other, "libusb transfer failed"),
+    };
+    io::Error::new(kind, description)
+}
+
 fn request_type_out() -> u8 {
-    rusb::request_type(Direction::Out, RequestType::Vendor, Recipient::Interface)
+    (LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_INTERFACE) as u8
+}
+
+fn duration_to_timeout(duration: Duration) -> c_uint {
+    if duration.is_zero() {
+        return 0;
+    }
+    let millis = duration.as_millis();
+    if millis == 0 {
+        1
+    } else if millis > c_uint::MAX as u128 {
+        c_uint::MAX
+    } else {
+        millis as c_uint
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -93,32 +158,477 @@ fn host_config_bytes() -> [u8; 4] {
     0x0000_beefu32.to_le_bytes()
 }
 
-fn find_gs_usb_interface(device: &Device<GlobalContext>) -> io::Result<Option<InterfaceInfo>> {
-    let config = device
-        .active_config_descriptor()
-        .or_else(|_| device.config_descriptor(0))
-        .map_err(map_usb_err)?;
+#[derive(Copy, Clone)]
+struct LibusbCtxPtr(*mut libusb::libusb_context);
 
-    for interface in config.interfaces() {
-        let number = interface.number();
-        for descriptor in interface.descriptors() {
-            if descriptor.class_code() != 0xff {
+unsafe impl Send for LibusbCtxPtr {}
+unsafe impl Sync for LibusbCtxPtr {}
+
+pub struct LibusbContext {
+    ptr: LibusbCtxPtr,
+    running: Arc<AtomicBool>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl LibusbContext {
+    pub fn new() -> io::Result<Arc<Self>> {
+        // Initialise libusb context
+        let mut ctx = std::ptr::null_mut();
+        let rc = unsafe { libusb::libusb_init(&mut ctx) };
+        if rc < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("libusb init failed: {}", rc),
+            ));
+        }
+
+        let ctx_ptr = Arc::new(LibusbCtxPtr(ctx));
+
+        // Control flag
+        let running = Arc::new(AtomicBool::new(true));
+
+        let running_thread = running.clone();
+        let ctx_for_thread = ctx_ptr.clone();
+
+        // Spawn background thread
+        let handle = std::thread::Builder::new()
+            .name("libusb-events".into())
+            .spawn(move || {
+                let mut timeval = libc::timeval {
+                    tv_sec: 1,
+                    tv_usec: 0,
+                };
+                while running_thread.load(Ordering::SeqCst) {
+                    let rc = unsafe {
+                        libusb::libusb_handle_events_timeout_completed(
+                            ctx_for_thread.0,
+                            &mut timeval,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    if rc == libusb::constants::LIBUSB_ERROR_INTERRUPTED {
+                        continue;
+                    }
+                    if rc < 0 && running_thread.load(Ordering::SeqCst) {
+                        std::thread::yield_now();
+                    }
+                }
+            })
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Failed to spawn libusb event thread: {e}"),
+                )
+            })?;
+
+        Ok(Arc::new(LibusbContext {
+            ptr: *ctx_ptr, // store as raw wrapper
+            running,
+            thread: Mutex::new(Some(handle)),
+        }))
+    }
+}
+
+impl Drop for LibusbContext {
+    fn drop(&mut self) {
+        // signal shutdown
+        self.running.store(false, Ordering::SeqCst);
+
+        // poke libusb so it unblocks
+        unsafe {
+            let mut zero = libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            };
+            let _ = libusb::libusb_handle_events_timeout_completed(
+                self.ptr.0,
+                &mut zero,
+                std::ptr::null_mut(),
+            );
+        }
+
+        // join the thread safely
+        if let Ok(mut guard) = self.thread.lock() {
+            if let Some(handle) = guard.take() {
+                let _ = handle.join();
+            }
+        }
+
+        // free the libusb context
+        unsafe { libusb::libusb_exit(self.ptr.0) };
+    }
+}
+
+struct LibusbDeviceHandle {
+    context: Arc<LibusbContext>,
+    handle: *mut libusb::libusb_device_handle,
+}
+
+unsafe impl Send for LibusbDeviceHandle {}
+unsafe impl Sync for LibusbDeviceHandle {}
+
+impl LibusbDeviceHandle {
+    fn open(context: Arc<LibusbContext>, device: *mut libusb::libusb_device) -> io::Result<Self> {
+        let mut handle = ptr::null_mut();
+        let rc = unsafe { libusb::libusb_open(device, &mut handle) };
+        if rc < 0 {
+            return Err(map_libusb_error(rc));
+        }
+        Ok(Self { context, handle })
+    }
+
+    fn raw(&self) -> *mut libusb::libusb_device_handle {
+        self.handle
+    }
+
+    fn set_auto_detach_kernel_driver(&self, enable: bool) -> io::Result<()> {
+        let flag = if enable { 1 } else { 0 };
+        let rc = unsafe { libusb::libusb_set_auto_detach_kernel_driver(self.handle, flag) };
+        if rc < 0 && rc != LIBUSB_ERROR_NOT_SUPPORTED {
+            return Err(map_libusb_error(rc));
+        }
+        Ok(())
+    }
+
+    fn claim_interface(&self, interface: i32) -> io::Result<()> {
+        let rc = unsafe { libusb::libusb_claim_interface(self.handle, interface) };
+        if rc < 0 {
+            return Err(map_libusb_error(rc));
+        }
+        Ok(())
+    }
+
+    fn clear_halt(&self, endpoint: u8) -> io::Result<()> {
+        let rc = unsafe { libusb::libusb_clear_halt(self.handle, endpoint) };
+        if rc < 0 {
+            return Err(map_libusb_error(rc));
+        }
+        Ok(())
+    }
+
+    async fn bulk_write(
+        &self,
+        endpoint: u8,
+        data: Vec<u8>,
+        timeout: Duration,
+    ) -> io::Result<usize> {
+        let (sender, receiver) = oneshot::channel();
+        let state = Box::new(BulkWriteState {
+            sender: Some(sender),
+            buffer: Some(data),
+        });
+        let state_ptr = Box::into_raw(state);
+        let transfer = unsafe { libusb::libusb_alloc_transfer(0) };
+        if transfer.is_null() {
+            unsafe {
+                let _ = Box::from_raw(state_ptr);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Failed to allocate libusb transfer",
+            ));
+        }
+        unsafe {
+            (*transfer).dev_handle = self.handle;
+            (*transfer).endpoint = endpoint;
+            (*transfer).transfer_type = LIBUSB_TRANSFER_TYPE_BULK;
+            (*transfer).timeout = duration_to_timeout(timeout);
+            (*transfer).callback = bulk_write_callback;
+            (*transfer).user_data = state_ptr as *mut c_void;
+            if let Some(buffer) = (&mut *state_ptr).buffer.as_mut() {
+                (*transfer).buffer = buffer.as_mut_ptr();
+                (*transfer).length = buffer.len() as c_int;
+            }
+        }
+        let submit = unsafe { libusb::libusb_submit_transfer(transfer) };
+        if submit < 0 {
+            unsafe {
+                let _ = Box::from_raw(state_ptr);
+                libusb::libusb_free_transfer(transfer);
+            }
+            return Err(map_libusb_error(submit));
+        }
+        match receiver.await {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Bulk write transfer channel closed",
+            )),
+        }
+    }
+
+    async fn bulk_read(
+        &self,
+        endpoint: u8,
+        length: usize,
+        timeout: Duration,
+    ) -> io::Result<Vec<u8>> {
+        let (sender, receiver) = oneshot::channel();
+        let state = Box::new(BulkReadState {
+            sender: Some(sender),
+            buffer: Some(vec![0u8; length]),
+        });
+        let state_ptr = Box::into_raw(state);
+        let transfer = unsafe { libusb::libusb_alloc_transfer(0) };
+        if transfer.is_null() {
+            unsafe {
+                let _ = Box::from_raw(state_ptr);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Failed to allocate libusb transfer",
+            ));
+        }
+        unsafe {
+            (*transfer).dev_handle = self.handle;
+            (*transfer).endpoint = endpoint;
+            (*transfer).transfer_type = LIBUSB_TRANSFER_TYPE_BULK;
+            (*transfer).timeout = duration_to_timeout(timeout);
+            (*transfer).callback = bulk_read_callback;
+            (*transfer).user_data = state_ptr as *mut c_void;
+            if let Some(buffer) = (&mut *state_ptr).buffer.as_mut() {
+                (*transfer).buffer = buffer.as_mut_ptr();
+                (*transfer).length = buffer.len() as c_int;
+            }
+        }
+        let submit = unsafe { libusb::libusb_submit_transfer(transfer) };
+        if submit < 0 {
+            unsafe {
+                let _ = Box::from_raw(state_ptr);
+                libusb::libusb_free_transfer(transfer);
+            }
+            return Err(map_libusb_error(submit));
+        }
+        match receiver.await {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Bulk read transfer channel closed",
+            )),
+        }
+    }
+
+    async fn control_out(
+        &self,
+        request_type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        data: Vec<u8>,
+        timeout: Duration,
+    ) -> io::Result<usize> {
+        let (sender, receiver) = oneshot::channel();
+        let mut buffer = vec![0u8; LIBUSB_CONTROL_SETUP_SIZE + data.len()];
+        unsafe {
+            libusb::libusb_fill_control_setup(
+                buffer.as_mut_ptr(),
+                request_type,
+                request,
+                value,
+                index,
+                data.len() as u16,
+            );
+        }
+        buffer[LIBUSB_CONTROL_SETUP_SIZE..].copy_from_slice(&data);
+        let state = Box::new(ControlTransferState {
+            sender: Some(sender),
+            buffer: Some(buffer),
+        });
+        let state_ptr = Box::into_raw(state);
+        let transfer = unsafe { libusb::libusb_alloc_transfer(0) };
+        if transfer.is_null() {
+            unsafe {
+                let _ = Box::from_raw(state_ptr);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Failed to allocate libusb transfer",
+            ));
+        }
+        unsafe {
+            (*transfer).dev_handle = self.handle;
+            (*transfer).endpoint = 0;
+            (*transfer).transfer_type = LIBUSB_TRANSFER_TYPE_CONTROL;
+            (*transfer).timeout = duration_to_timeout(timeout);
+            (*transfer).callback = control_callback;
+            (*transfer).user_data = state_ptr as *mut c_void;
+            if let Some(buffer) = (&mut *state_ptr).buffer.as_mut() {
+                (*transfer).buffer = buffer.as_mut_ptr();
+                (*transfer).length = buffer.len() as c_int;
+            }
+        }
+        let submit = unsafe { libusb::libusb_submit_transfer(transfer) };
+        if submit < 0 {
+            unsafe {
+                let _ = Box::from_raw(state_ptr);
+                libusb::libusb_free_transfer(transfer);
+            }
+            return Err(map_libusb_error(submit));
+        }
+        match receiver.await {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Control transfer channel closed",
+            )),
+        }
+    }
+}
+
+impl Drop for LibusbDeviceHandle {
+    fn drop(&mut self) {
+        unsafe {
+            libusb::libusb_close(self.handle);
+        }
+    }
+}
+
+struct BulkWriteState {
+    sender: Option<oneshot::Sender<io::Result<usize>>>,
+    buffer: Option<Vec<u8>>,
+}
+
+struct BulkReadState {
+    sender: Option<oneshot::Sender<io::Result<Vec<u8>>>>,
+    buffer: Option<Vec<u8>>,
+}
+
+struct ControlTransferState {
+    sender: Option<oneshot::Sender<io::Result<usize>>>,
+    buffer: Option<Vec<u8>>,
+}
+
+extern "system" fn bulk_write_callback(transfer: *mut libusb::libusb_transfer) {
+    unsafe {
+        let state_ptr = (*transfer).user_data as *mut BulkWriteState;
+        let mut state = Box::from_raw(state_ptr);
+        let result = if (*transfer).status == LIBUSB_TRANSFER_COMPLETED {
+            Ok((*transfer).actual_length as usize)
+        } else {
+            Err(map_transfer_status((*transfer).status))
+        };
+        state.buffer.take();
+        if let Some(sender) = state.sender.take() {
+            let _ = sender.send(result);
+        }
+        libusb::libusb_free_transfer(transfer);
+    }
+}
+
+extern "system" fn bulk_read_callback(transfer: *mut libusb::libusb_transfer) {
+    unsafe {
+        let state_ptr = (*transfer).user_data as *mut BulkReadState;
+        let mut state = Box::from_raw(state_ptr);
+        let status = (*transfer).status;
+        let result = if status == LIBUSB_TRANSFER_COMPLETED {
+            if let Some(mut buffer) = state.buffer.take() {
+                let actual = (*transfer).actual_length as usize;
+                buffer.truncate(actual);
+                Ok(buffer)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Bulk read buffer missing",
+                ))
+            }
+        } else {
+            Err(map_transfer_status(status))
+        };
+        if let Some(sender) = state.sender.take() {
+            let _ = sender.send(result);
+        }
+        libusb::libusb_free_transfer(transfer);
+    }
+}
+
+extern "system" fn control_callback(transfer: *mut libusb::libusb_transfer) {
+    unsafe {
+        let state_ptr = (*transfer).user_data as *mut ControlTransferState;
+        let mut state = Box::from_raw(state_ptr);
+        let status = (*transfer).status;
+        let result = if status == LIBUSB_TRANSFER_COMPLETED {
+            Ok((*transfer).actual_length as usize)
+        } else {
+            Err(map_transfer_status(status))
+        };
+        state.buffer.take();
+        if let Some(sender) = state.sender.take() {
+            let _ = sender.send(result);
+        }
+        libusb::libusb_free_transfer(transfer);
+    }
+}
+
+struct ConfigDescriptor(*const libusb::libusb_config_descriptor);
+
+impl ConfigDescriptor {
+    unsafe fn active(device: *mut libusb::libusb_device) -> io::Result<Self> {
+        let mut ptr = ptr::null();
+        let rc = unsafe { libusb::libusb_get_active_config_descriptor(device, &mut ptr) };
+        if rc < 0 {
+            return Err(map_libusb_error(rc));
+        }
+        Ok(Self(ptr))
+    }
+
+    unsafe fn by_index(device: *mut libusb::libusb_device, index: u8) -> io::Result<Self> {
+        let mut ptr = ptr::null();
+        let rc = unsafe { libusb::libusb_get_config_descriptor(device, index as u8, &mut ptr) };
+        if rc < 0 {
+            return Err(map_libusb_error(rc));
+        }
+        Ok(Self(ptr))
+    }
+}
+
+impl Drop for ConfigDescriptor {
+    fn drop(&mut self) {
+        unsafe {
+            libusb::libusb_free_config_descriptor(self.0);
+        }
+    }
+}
+
+unsafe fn find_gs_usb_interface(
+    device: *mut libusb::libusb_device,
+) -> io::Result<Option<InterfaceInfo>> {
+    let config = match unsafe { ConfigDescriptor::active(device) } {
+        Ok(cfg) => cfg,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => unsafe {
+            ConfigDescriptor::by_index(device, 0)?
+        },
+        Err(err) => return Err(err),
+    };
+
+    let config_ptr = config.0;
+    let interface_count = unsafe { (*config_ptr).bNumInterfaces };
+    for interface_index in 0..interface_count {
+        let interface = unsafe { &*(*config_ptr).interface.add(interface_index as usize) };
+        for alt_index in 0..interface.num_altsetting as usize {
+            let descriptor = unsafe { &*interface.altsetting.add(alt_index) };
+            if descriptor.bInterfaceClass != 0xff {
                 continue;
             }
             let mut info = InterfaceInfo {
-                interface: number,
+                interface: descriptor.bInterfaceNumber,
                 in_ep: 0,
                 out_ep: 0,
                 int_ep: None,
             };
-            for endpoint in descriptor.endpoint_descriptors() {
-                match endpoint.transfer_type() {
-                    TransferType::Bulk => match endpoint.direction() {
-                        Direction::In => info.in_ep = endpoint.address(),
-                        Direction::Out => info.out_ep = endpoint.address(),
-                    },
-                    TransferType::Interrupt if endpoint.direction() == Direction::In => {
-                        info.int_ep = Some(endpoint.address())
+            for ep_index in 0..descriptor.bNumEndpoints as usize {
+                let endpoint = unsafe { &*descriptor.endpoint.add(ep_index) };
+                match endpoint.bmAttributes & 0x3 {
+                    x if x == LIBUSB_TRANSFER_TYPE_BULK => {
+                        if endpoint.bEndpointAddress & LIBUSB_ENDPOINT_IN != 0 {
+                            info.in_ep = endpoint.bEndpointAddress;
+                        } else {
+                            info.out_ep = endpoint.bEndpointAddress;
+                        }
+                    }
+                    x if x == LIBUSB_TRANSFER_TYPE_INTERRUPT => {
+                        if endpoint.bEndpointAddress & LIBUSB_ENDPOINT_IN != 0 {
+                            info.int_ep = Some(endpoint.bEndpointAddress);
+                        }
                     }
                     _ => {}
                 }
@@ -132,12 +642,43 @@ fn find_gs_usb_interface(device: &Device<GlobalContext>) -> io::Result<Option<In
     Ok(None)
 }
 
+fn get_device_descriptor(
+    device: *mut libusb::libusb_device,
+) -> io::Result<libusb::libusb_device_descriptor> {
+    let mut desc = MaybeUninit::<libusb::libusb_device_descriptor>::uninit();
+    let rc = unsafe { libusb::libusb_get_device_descriptor(device, desc.as_mut_ptr()) };
+    if rc < 0 {
+        return Err(map_libusb_error(rc));
+    }
+    Ok(unsafe { desc.assume_init() })
+}
+
+fn read_string_descriptor(handle: &LibusbDeviceHandle, index: u8) -> Option<String> {
+    if index == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; 255];
+    let len = unsafe {
+        libusb::libusb_get_string_descriptor_ascii(
+            handle.raw(),
+            index,
+            buf.as_mut_ptr(),
+            buf.len() as c_int,
+        )
+    };
+    if len < 0 {
+        return None;
+    }
+    buf.truncate(len as usize);
+    String::from_utf8(buf).ok()
+}
+
 fn device_matches_identifier(
     identifier: &str,
     index: usize,
-    device: &Device<GlobalContext>,
-    desc: &DeviceDescriptor,
-    handle: &mut DeviceHandle<GlobalContext>,
+    device: *mut libusb::libusb_device,
+    desc: &libusb::libusb_device_descriptor,
+    handle: &LibusbDeviceHandle,
 ) -> bool {
     let ident = identifier.trim();
     if ident.eq_ignore_ascii_case("auto") {
@@ -150,56 +691,96 @@ fn device_matches_identifier(
         }
     }
 
-    if let Ok(serial) = handle.read_serial_number_string_ascii(desc) {
+    if let Some(serial) = read_string_descriptor(handle, desc.iSerialNumber) {
         if serial.eq_ignore_ascii_case(ident) {
             return true;
         }
     }
 
-    if let Ok(product) = handle.read_product_string_ascii(desc) {
+    if let Some(product) = read_string_descriptor(handle, desc.iProduct) {
         if product.eq_ignore_ascii_case(ident) {
             return true;
         }
     }
 
-    let bus_addr = format!("{:03}:{:03}", device.bus_number(), device.address());
+    let bus = unsafe { libusb::libusb_get_bus_number(device) };
+    let address = unsafe { libusb::libusb_get_device_address(device) };
+    let bus_addr = format!("{:03}:{:03}", bus, address);
     bus_addr.eq_ignore_ascii_case(ident)
 }
 
+fn read_product_label(
+    handle: &LibusbDeviceHandle,
+    desc: &libusb::libusb_device_descriptor,
+) -> Option<String> {
+    read_string_descriptor(handle, desc.iProduct)
+        .or_else(|| read_string_descriptor(handle, desc.iSerialNumber))
+        .or_else(|| Some(format!("{:04x}:{:04x}", desc.idVendor, desc.idProduct)))
+}
+
 fn select_device(
+    context: &Arc<LibusbContext>,
     identifier: &str,
-) -> io::Result<(DeviceHandle<GlobalContext>, InterfaceInfo, String)> {
-    let devices = rusb::devices().map_err(map_usb_err)?;
+) -> io::Result<(LibusbDeviceHandle, InterfaceInfo, String)> {
+    let mut list = ptr::null();
+    let count = unsafe { libusb::libusb_get_device_list(context.ptr.0, &mut list) };
+    if count < 0 {
+        return Err(map_libusb_error(count as i32));
+    }
+
+    let mut result: Option<(LibusbDeviceHandle, InterfaceInfo, String)> = None;
     let mut index = 0usize;
+    let mut error: Option<io::Error> = None;
 
-    for device in devices.iter() {
-        let desc = match device.device_descriptor() {
+    for i in 0..count {
+        let device = unsafe { *list.add(i as usize) };
+        let desc = match get_device_descriptor(device) {
             Ok(d) => d,
-            Err(e) => return Err(map_usb_err(e)),
+            Err(e) => {
+                error = Some(e);
+                break;
+            }
         };
 
-        let info = match find_gs_usb_interface(&device)? {
-            Some(i) => i,
-            None => continue,
+        let info = match unsafe { find_gs_usb_interface(device) } {
+            Ok(Some(info)) => info,
+            Ok(None) => continue,
+            Err(e) => {
+                error = Some(e);
+                break;
+            }
         };
 
-        let mut handle = match device.open() {
+        let handle = match LibusbDeviceHandle::open(context.clone(), device) {
             Ok(h) => h,
-            Err(e) => return Err(map_usb_err(e)),
+            Err(e) => {
+                error = Some(e);
+                break;
+            }
         };
 
-        let matches = device_matches_identifier(identifier, index, &device, &desc, &mut handle);
+        let matches = device_matches_identifier(identifier, index, device, &desc, &handle);
 
         if matches {
-            let label = handle
-                .read_product_string_ascii(&desc)
-                .ok()
-                .or_else(|| handle.read_serial_number_string_ascii(&desc).ok())
-                .unwrap_or_else(|| format!("{:04x}:{:04x}", desc.vendor_id(), desc.product_id()));
-            return Ok((handle, info, label));
+            let label = read_product_label(&handle, &desc)
+                .unwrap_or_else(|| format!("{:04x}:{:04x}", desc.idVendor, desc.idProduct));
+            result = Some((handle, info, label));
+            break;
         }
 
         index += 1;
+    }
+
+    unsafe {
+        libusb::libusb_free_device_list(list, 1);
+    }
+
+    if let Some((handle, info, label)) = result {
+        return Ok((handle, info, label));
+    }
+
+    if let Some(err) = error {
+        return Err(err);
     }
 
     Err(io::Error::new(
@@ -287,32 +868,43 @@ fn dlc_to_len(dlc: u8) -> usize {
     }
 }
 
-fn parse_host_frame(bytes: &[u8], channel_index: u8) -> Option<CanFrame> {
-    if bytes.len() < HOST_FRAME_SIZE {
+/// Parses one frame starting at bytes[0], returns (maybe_frame, consumed_len).
+fn parse_host_frame_at(
+    bytes: &[u8],
+    channel_index: u8,
+    timestamp_enabled: bool,
+    last_ts64: &mut Option<u64>,
+) -> Option<(Option<CanFrame>, usize)> {
+    if bytes.len() < GS_HEADER_LEN {
         return None;
     }
 
     let echo_id = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
-    if echo_id != GS_CAN_ECHO_ID_UNUSED {
-        return None;
-    }
-
     let raw_id = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
     let dlc = bytes[8];
-    let channel = bytes[9];
-    let _flags = bytes[10];
-    let _reserved = bytes[11];
-
-    if channel != channel_index {
-        return None;
-    }
-
+    let chan = bytes[9];
     let data_len = dlc_to_len(dlc);
-    if data_len > 64 {
+
+    let mut ts_len = 0;
+    if timestamp_enabled && bytes.len() >= GS_HEADER_LEN + GS_TS_LEN {
+        ts_len = GS_TS_LEN;
+    }
+
+    let total_len = GS_HEADER_LEN + ts_len + data_len;
+    if total_len == 0 || total_len > GS_MAX_FRAME_LEN {
+        // malformed, skip 1 byte
+        return Some((None, 1));
+    }
+    if bytes.len() < total_len {
         return None;
     }
 
-    let data = &bytes[16..16 + data_len];
+    if echo_id != GS_CAN_ECHO_ID_UNUSED || chan != channel_index {
+        return Some((None, total_len));
+    }
+
+    let data_start = GS_HEADER_LEN + ts_len;
+    let data = &bytes[data_start..data_start + data_len];
 
     let mut frame = if (raw_id & CAN_ERR_FLAG) != 0 {
         CanFrame::new_error(raw_id & CAN_ERR_MASK).ok()?
@@ -334,12 +926,29 @@ fn parse_host_frame(bytes: &[u8], channel_index: u8) -> Option<CanFrame> {
         CanFrame::new(raw_id & CAN_SFF_MASK, data).ok()?
     };
 
-    Some(frame)
+    if ts_len == 4 {
+        let ts32 =
+            u32::from_le_bytes(bytes[GS_HEADER_LEN..GS_HEADER_LEN + 4].try_into().unwrap()) as u64;
+        let ts64 = match *last_ts64 {
+            None => ts32,
+            Some(last) => {
+                let base = last & !0xFFFF_FFFFu64;
+                let mut candidate = base | ts32;
+                if candidate < last {
+                    candidate = candidate.wrapping_add(1u64 << 32);
+                }
+                candidate
+            }
+        };
+        *last_ts64 = Some(ts64);
+        frame.set_timestamp(Some(ts64));
+    }
+
+    Some((Some(frame), total_len))
 }
 
-/// Driver for devices implementing the gs_usb protocol (e.g. candleLight / CANable).
 pub struct GsUsbDriver {
-    handle: Arc<Mutex<DeviceHandle<GlobalContext>>>,
+    handle: LibusbDeviceHandle,
     interface: u8,
     in_ep: u8,
     out_ep: u8,
@@ -355,37 +964,15 @@ pub struct GsUsbDriver {
 }
 
 impl GsUsbDriver {
-    fn open_sync(identifier: &str) -> io::Result<Self> {
-        let (mut handle, info, label) = select_device(identifier)?;
+    pub async fn open(identifier: &str) -> io::Result<Self> {
+        let context = LibusbContext::new()?;
+        let (handle, info, label) = select_device(&context, identifier)?;
 
         let _ = handle.set_auto_detach_kernel_driver(true);
+        handle.claim_interface(info.interface as i32)?;
 
-        handle
-            .claim_interface(info.interface)
-            .or_else(|_| handle.claim_interface(info.interface))
-            .map_err(map_usb_err)?;
-
-        let req_type = request_type_out();
-        let host_cfg = host_config_bytes();
-        let written = handle
-            .write_control(
-                req_type,
-                GS_USB_BREQ_HOST_FORMAT,
-                0,
-                info.interface as u16,
-                &host_cfg,
-                USB_TIMEOUT,
-            )
-            .map_err(map_usb_err)?;
-        if written != host_cfg.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Failed to send host format command to gs_usb device",
-            ));
-        }
-
-        let mut driver = GsUsbDriver {
-            handle: Arc::new(Mutex::new(handle)),
+        let driver = GsUsbDriver {
+            handle,
             interface: info.interface,
             in_ep: info.in_ep,
             out_ep: info.out_ep,
@@ -399,60 +986,14 @@ impl GsUsbDriver {
             last_timestamp64: None,
         };
 
-        // Reset device into known state.
+        let host_cfg = host_config_bytes();
+        driver
+            .send_control(GS_USB_BREQ_HOST_FORMAT, &host_cfg)
+            .await?;
         let reset_bytes = encode_mode(GS_CAN_MODE_RESET, 0);
-        driver.send_control_sync(GS_USB_BREQ_MODE, &reset_bytes)?;
+        driver.send_control(GS_USB_BREQ_MODE, &reset_bytes).await?;
 
         Ok(driver)
-    }
-
-    fn send_control_sync(&mut self, request: u8, data: &[u8]) -> io::Result<()> {
-        let mut handle = self
-            .handle
-            .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "USB handle mutex poisoned"))?;
-        let written = handle
-            .write_control(
-                request_type_out(),
-                request,
-                0,
-                self.interface as u16,
-                data,
-                USB_TIMEOUT,
-            )
-            .map_err(map_usb_err)?;
-        if written != data.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Incomplete control transfer to gs_usb device",
-            ));
-        }
-        Ok(())
-    }
-
-    async fn with_handle<T, F>(&self, f: F) -> io::Result<T>
-    where
-        T: Send + 'static,
-        F: FnOnce(&mut DeviceHandle<GlobalContext>) -> io::Result<T> + Send + 'static,
-    {
-        let handle = self.handle.clone();
-        task::spawn_blocking(move || {
-            let mut guard = handle
-                .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "USB handle mutex poisoned"))?;
-            f(&mut guard)
-        })
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("USB task join error: {e}")))?
-    }
-
-    pub async fn open(identifier: &str) -> io::Result<Self> {
-        let id = identifier.to_string();
-        task::spawn_blocking(move || Self::open_sync(&id))
-            .await
-            .map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("USB task join error: {e}"))
-            })?
     }
 
     pub fn device_label(&self) -> &str {
@@ -460,28 +1001,24 @@ impl GsUsbDriver {
     }
 
     async fn send_control(&self, request: u8, data: &[u8]) -> io::Result<()> {
-        let interface = self.interface;
-        let data = data.to_vec();
-        self.with_handle(move |handle| {
-            let written = handle
-                .write_control(
-                    request_type_out(),
-                    request,
-                    0,
-                    interface as u16,
-                    &data,
-                    USB_TIMEOUT,
-                )
-                .map_err(map_usb_err)?;
-            if written != data.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Incomplete control transfer to gs_usb device",
-                ));
-            }
-            Ok(())
-        })
-        .await
+        let written = self
+            .handle
+            .control_out(
+                request_type_out(),
+                request,
+                0,
+                self.interface as u16,
+                data.to_vec(),
+                USB_TIMEOUT,
+            )
+            .await?;
+        if written != data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Incomplete control transfer to gs_usb device",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -521,13 +1058,8 @@ impl CanDriver for GsUsbDriver {
     }
 
     async fn send_frame(&mut self, frame: &CanFrame) -> io::Result<()> {
-        let mut buffer = [0u8; HOST_FRAME_SIZE];
+        let mut buffer = vec![0u8; HOST_FRAME_SIZE];
 
-        // echo id
-        let echo_id = self.tx_counter.fetch_add(1, Ordering::Relaxed) % GS_USB_MAX_ECHO_SLOTS;
-        buffer[0..4].copy_from_slice(&echo_id.to_le_bytes());
-
-        // can_id (+ flags)
         let mut can_id = frame.id();
         if frame.is_extended() {
             can_id |= CAN_EFF_FLAG;
@@ -540,118 +1072,93 @@ impl CanDriver for GsUsbDriver {
         }
         buffer[4..8].copy_from_slice(&can_id.to_le_bytes());
 
-        // dlc/channel/flags/reserved
         buffer[8] = frame.dlc() as u8;
         buffer[9] = self.channel_index;
-        buffer[10] = 0; // flags
-        buffer[11] = 0; // reserved
-
-        // 32-bit timestamp for TX should be zeroed
+        buffer[10] = 0;
+        buffer[11] = 0;
         buffer[12..16].fill(0);
 
-        // data (start at 16)
-        let data_len = std::cmp::min(frame.data().len(), 64);
-        buffer[16..16 + data_len].copy_from_slice(&frame.data()[..data_len]);
+        let frame_data = frame.data();
+        let data_len = frame_data.len().min(64);
+        buffer[16..16 + data_len].copy_from_slice(&frame_data[..data_len]);
 
-        let out_ep = self.out_ep;
-        self.with_handle(move |handle| {
-            let written = handle
-                .write_bulk(out_ep, &buffer, USB_TIMEOUT)
-                .map_err(map_usb_err)?;
-            if written != HOST_FRAME_SIZE {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Incomplete bulk transfer when sending CAN frame",
-                ));
-            }
-            Ok(())
-        })
-        .await
+        let written = self
+            .handle
+            .bulk_write(self.out_ep, buffer, USB_TIMEOUT)
+            .await?;
+        if written != HOST_FRAME_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Incomplete bulk transfer when sending CAN frame",
+            ));
+        }
+        Ok(())
     }
 
     async fn read_frames(&mut self) -> io::Result<Vec<CanFrame>> {
-        let in_ep = self.in_ep;
-
-        // Drain as much as we can in one blocking section to avoid per-call overhead.
-        let mut data = self
-            .with_handle(move |handle| {
-                // One big reusable chunk per read.
-                let mut tmp = vec![0u8; HOST_FRAME_SIZE * READ_CHUNK_FRAMES];
-                let mut out = Vec::with_capacity(tmp.len() * 2);
-
-                // First read with the normal timeout (up to 100ms).
-                match handle.read_bulk(in_ep, &mut tmp, USB_TIMEOUT) {
-                    Ok(n) if n > 0 => out.extend_from_slice(&tmp[..n]),
-                    Ok(_) | Err(rusb::Error::Timeout) => return Ok(Vec::new()),
-                    Err(e) => return Err(map_usb_err(e)),
-                }
-
-                // Quickly drain anything queued using a tiny timeout, until we get a short read or timeout.
-                loop {
-                    match handle.read_bulk(in_ep, &mut tmp, DRAIN_READ_TIMEOUT) {
-                        Ok(n) if n > 0 => {
-                            out.extend_from_slice(&tmp[..n]);
-                            // Heuristic: if the device returned less than our chunk, likely drained.
-                            if n < tmp.len() {
-                                break;
-                            }
-                        }
-                        Ok(_) | Err(rusb::Error::Timeout) => break,
-                        Err(rusb::Error::Pipe) => {
-                            // Recoverable: clear halt and stop draining this cycle.
-                            let _ = handle.clear_halt(in_ep);
-                            break;
-                        }
-                        Err(e) => return Err(map_usb_err(e)),
+        let mut first = true;
+        loop {
+            let timeout = if first {
+                USB_TIMEOUT
+            } else {
+                DRAIN_READ_TIMEOUT
+            };
+            let chunk = match self
+                .handle
+                .bulk_read(self.in_ep, USB_READ_BYTES, timeout)
+                .await
+            {
+                Ok(chunk) => chunk,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    if first {
+                        return Ok(Vec::new());
                     }
+                    break;
                 }
-                Ok(out)
-            })
-            .await?;
+                Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {
+                    let _ = self.handle.clear_halt(self.in_ep);
+                    break;
+                }
+                Err(err) => return Err(err),
+            };
 
-        if data.is_empty() {
-            return Ok(Vec::new());
+            if chunk.is_empty() {
+                if first {
+                    return Ok(Vec::new());
+                }
+                break;
+            }
+            first = false;
+            self.rx_leftover.extend_from_slice(&chunk);
         }
-
-        self.rx_leftover.append(&mut data);
 
         let mut frames = Vec::new();
-        let mut processed = 0usize;
-        while self.rx_leftover.len() >= processed + HOST_FRAME_SIZE {
-            let slice = &self.rx_leftover[processed..processed + HOST_FRAME_SIZE];
-            if let Some(mut frame) = parse_host_frame(slice, self.channel_index) {
-                // If timestamping is enabled, parse the 32-bit µs counter and extend to 64-bit.
-                if self.timestamp_enabled && frame.timestamp().is_none() {
-                    // On-wire is always 32-bit little-endian microseconds since device boot.
-                    let ts32 = u32::from_le_bytes(slice[12..16].try_into().unwrap()) as u64;
+        let mut offset = 0usize;
 
-                    // Extend to a monotonic 64-bit counter across wraparounds (~71 min period).
-                    let ts64 = match self.last_timestamp64 {
-                        None => ts32, // first observation
-                        Some(last) => {
-                            // Take upper 32 bits from last, splice in current 32-bit value.
-                            let base = last & !0xFFFF_FFFFu64;
-                            let mut candidate = base | ts32;
-                            if candidate < last {
-                                // 32-bit counter wrapped; bump upper bits by 1.
-                                candidate = candidate.wrapping_add(1u64 << 32);
-                            }
-                            candidate
-                        }
-                    };
-
-                    self.last_timestamp64 = Some(ts64);
-                    frame.set_timestamp(Some(ts64));
+        while self.rx_leftover.len() >= offset + GS_HEADER_LEN {
+            let slice = &self.rx_leftover[offset..];
+            match parse_host_frame_at(
+                slice,
+                self.channel_index,
+                self.timestamp_enabled,
+                &mut self.last_timestamp64,
+            ) {
+                None => break,
+                Some((maybe_frame, consumed)) => {
+                    if consumed == 0 {
+                        offset += 1;
+                        continue;
+                    }
+                    if let Some(frame) = maybe_frame {
+                        frames.push(frame);
+                    }
+                    offset += consumed;
                 }
-                frames.push(frame);
             }
-            processed += HOST_FRAME_SIZE;
         }
-
-        if processed > 0 {
-            self.rx_leftover.drain(..processed);
+        if offset > 0 {
+            self.rx_leftover.drain(..offset);
         }
-
         Ok(frames)
     }
 

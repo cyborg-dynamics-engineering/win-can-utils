@@ -925,16 +925,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rusb"
-version = "0.9.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab9f9ff05b63a786553a4c02943b74b34a988448671001e9a27e2f0565cc05a4"
-dependencies = [
- "libc",
- "libusb1-sys",
-]
-
-[[package]]
 name = "rustc-demangle"
 version = "0.1.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1246,12 +1236,13 @@ dependencies = [
  "crosscan",
  "ctrlc",
  "futures",
+ "libc",
+ "libusb1-sys",
  "memchr",
  "mpsc",
  "named_pipe",
  "peak-can-sys",
  "ringbuf",
- "rusb",
  "serde",
  "serialport",
  "tokio",
