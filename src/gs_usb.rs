@@ -194,9 +194,10 @@ impl LibusbContext {
         let handle = std::thread::Builder::new()
             .name("libusb-events".into())
             .spawn(move || {
+                // 10ms poll keeps latency low and prevents stalling async callbacks
                 let mut timeval = libc::timeval {
-                    tv_sec: 1,
-                    tv_usec: 0,
+                    tv_sec: 0,
+                    tv_usec: 10_000,
                 };
                 while running_thread.load(Ordering::SeqCst) {
                     let rc = unsafe {
@@ -868,44 +869,121 @@ fn dlc_to_len(dlc: u8) -> usize {
     }
 }
 
+#[inline]
+fn plausible_header(hdr: &[u8], expected_chan: u8) -> bool {
+    if hdr.len() < GS_HEADER_LEN {
+        return false;
+    }
+    // header fields we can sanity-check quickly
+    let _echo = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    let _id = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+    let dlc = hdr[8];
+    let chan = hdr[9];
+    // flags := hdr[10], reserved := hdr[11]
+
+    // DLC must map to <=64 bytes
+    let len = dlc_to_len(dlc);
+    if len > GS_MAX_DATA {
+        return false;
+    }
+
+    // Channel should usually match (or at least be small). We prioritize exact match.
+    if chan != expected_chan {
+        return false;
+    }
+
+    true
+}
+
 /// Parses one frame starting at bytes[0], returns (maybe_frame, consumed_len).
 fn parse_host_frame_at(
     bytes: &[u8],
     channel_index: u8,
-    timestamp_enabled: bool,
+    _timestamp_enabled: bool, // advisory only; we adapt per-frame
     last_ts64: &mut Option<u64>,
 ) -> Option<(Option<CanFrame>, usize)> {
     if bytes.len() < GS_HEADER_LEN {
         return None;
     }
 
+    // Read minimal header
     let echo_id = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
     let raw_id = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
     let dlc = bytes[8];
     let chan = bytes[9];
+
     let data_len = dlc_to_len(dlc);
-
-    let mut ts_len = 0;
-    if timestamp_enabled && bytes.len() >= GS_HEADER_LEN + GS_TS_LEN {
-        ts_len = GS_TS_LEN;
-    }
-
-    let total_len = GS_HEADER_LEN + ts_len + data_len;
-    if total_len == 0 || total_len > GS_MAX_FRAME_LEN {
-        // malformed, skip 1 byte
+    if data_len > GS_MAX_DATA {
+        // malformed dlc -> skip one byte to resync
         return Some((None, 1));
     }
-    if bytes.len() < total_len {
-        return None;
+
+    // Consider two candidate layouts: without and with timestamp
+    let len_no_ts = GS_HEADER_LEN + data_len;
+    let len_with_ts = GS_HEADER_LEN + GS_TS_LEN + data_len;
+
+    // Decide which layout is more plausible by peeking at the next header (if available).
+    // Prefer a layout that leaves the next header aligned and plausible.
+    let mut use_ts = false;
+    let have_no_ts = bytes.len() >= len_no_ts;
+    let have_with_ts = bytes.len() >= len_with_ts;
+
+    if have_with_ts && bytes.len() >= len_with_ts + GS_HEADER_LEN {
+        let next_hdr = &bytes[len_with_ts..len_with_ts + GS_HEADER_LEN];
+        if plausible_header(next_hdr, channel_index) {
+            use_ts = true;
+        }
     }
 
+    if !use_ts && have_no_ts && bytes.len() >= len_no_ts + GS_HEADER_LEN {
+        let next_hdr = &bytes[len_no_ts..len_no_ts + GS_HEADER_LEN];
+        if plausible_header(next_hdr, channel_index) {
+            use_ts = false;
+        }
+    }
+
+    // If only one variant fits in the available bytes, take that.
+    let total_len = if use_ts {
+        if !have_with_ts {
+            // not enough yet
+            return None;
+        }
+        len_with_ts
+    } else {
+        if !have_no_ts {
+            // try timestamped if that one fits
+            if have_with_ts {
+                use_ts = true;
+                len_with_ts
+            } else {
+                return None;
+            }
+        } else {
+            len_no_ts
+        }
+    };
+
+    if total_len == 0 || total_len > GS_MAX_FRAME_LEN {
+        return Some((None, 1)); // safety
+    }
+
+    // Consume echoes / other channels but keep stream moving
     if echo_id != GS_CAN_ECHO_ID_UNUSED || chan != channel_index {
         return Some((None, total_len));
     }
 
-    let data_start = GS_HEADER_LEN + ts_len;
-    let data = &bytes[data_start..data_start + data_len];
+    // Data offset after optional timestamp
+    let ts_off = GS_HEADER_LEN;
+    let data_off = if use_ts {
+        GS_HEADER_LEN + GS_TS_LEN
+    } else {
+        GS_HEADER_LEN
+    };
 
+    // Bounds are guaranteed by total_len checks
+    let data = &bytes[data_off..data_off + data_len];
+
+    // Build frame
     let mut frame = if (raw_id & CAN_ERR_FLAG) != 0 {
         CanFrame::new_error(raw_id & CAN_ERR_MASK).ok()?
     } else if (raw_id & CAN_RTR_FLAG) != 0 {
@@ -926,9 +1004,9 @@ fn parse_host_frame_at(
         CanFrame::new(raw_id & CAN_SFF_MASK, data).ok()?
     };
 
-    if ts_len == 4 {
-        let ts32 =
-            u32::from_le_bytes(bytes[GS_HEADER_LEN..GS_HEADER_LEN + 4].try_into().unwrap()) as u64;
+    // Timestamp (if we selected the ts variant)
+    if use_ts {
+        let ts32 = u32::from_le_bytes(bytes[ts_off..ts_off + 4].try_into().unwrap()) as u64;
         let ts64 = match *last_ts64 {
             None => ts32,
             Some(last) => {
@@ -1140,22 +1218,24 @@ impl CanDriver for GsUsbDriver {
             match parse_host_frame_at(
                 slice,
                 self.channel_index,
-                self.timestamp_enabled,
+                self.timestamp_enabled, // advisory only now
                 &mut self.last_timestamp64,
             ) {
-                None => break,
+                None => break, // need more bytes
                 Some((maybe_frame, consumed)) => {
-                    if consumed == 0 {
-                        offset += 1;
-                        continue;
-                    }
+                    let c = if consumed == 0 || consumed > GS_MAX_FRAME_LEN {
+                        1
+                    } else {
+                        consumed
+                    };
                     if let Some(frame) = maybe_frame {
                         frames.push(frame);
                     }
-                    offset += consumed;
+                    offset += c;
                 }
             }
         }
+
         if offset > 0 {
             self.rx_leftover.drain(..offset);
         }
