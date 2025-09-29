@@ -2,8 +2,9 @@ use async_trait::async_trait;
 use bincode::enc::write;
 /// Provides the SlcanDriver that exposes a serial port as a CAN interface.
 use crosscan::can::CanFrame;
+use memchr::memchr;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, split};
+use tokio::io::{split, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use tokio_serial::SerialStream;
 
@@ -35,7 +36,7 @@ impl SlcanDriver {
     }
 
     /// Parse SLCAN frame line from bytes, optionally with timestamp
-    fn parse_slcan_line_bytes(&mut self, line: &[u8]) -> Option<CanFrame> {
+    fn parse_slcan_line_bytes(timestamp_high: &mut u32, line: &[u8]) -> Option<CanFrame> {
         if line.is_empty() {
             return None;
         }
@@ -80,7 +81,7 @@ impl SlcanDriver {
                 (id, true, dlc, 10, 10 + dlc * 2)
             }
             'J' => {
-                self.timestamp_high = self.timestamp_high.wrapping_add(1);
+                *timestamp_high = timestamp_high.wrapping_add(1);
                 return None;
             }
             _ => return None,
@@ -100,7 +101,7 @@ impl SlcanDriver {
 
         let timestamp = if has_timestamp && line.len() >= ts_start + 8 {
             parse_hex_u32(&line[ts_start..ts_start + 8])
-                .map(|low| ((self.timestamp_high as u64) << 32) | (low as u64))
+                .map(|low| ((u64::from(*timestamp_high) << 32) | u64::from(low)))
         } else {
             None
         };
@@ -270,14 +271,19 @@ impl CanDriver for SlcanDriver {
             }
         }
 
-        while let Some(pos) = {
-            let leftover = &self.leftover;
-            leftover.iter().position(|&b| b == b'\r')
-        } {
-            let line: Vec<u8> = self.leftover.drain(..=pos).collect();
-            if let Some(frame) = self.parse_slcan_line_bytes(&line) {
+        let mut processed = 0;
+
+        while let Some(relative_pos) = memchr(b'\r', &self.leftover[processed..]) {
+            let end = processed + relative_pos + 1;
+            let line = &self.leftover[processed..end];
+            if let Some(frame) = Self::parse_slcan_line_bytes(&mut self.timestamp_high, line) {
                 frames.push(frame);
             }
+            processed = end;
+        }
+
+        if processed > 0 {
+            self.leftover.drain(..processed);
         }
 
         Ok(frames)
