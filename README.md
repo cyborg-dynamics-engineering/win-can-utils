@@ -6,6 +6,7 @@ This project aims to provide a Windows equivalent of [can-utils](https://github.
 - [Windows CAN Utils](#windows-can-utils)
   - [Table of Contents](#table-of-contents)
   - [Installation](#installation)
+  - [PCAN-Basic dependency](#pcan-basic-dependency)
   - [Usage](#usage)
     - [CAN Server](#can-server)
     - [CAN Dump](#can-dump)
@@ -61,7 +62,7 @@ Opens a CAN connection to a USB-to-CAN adapter and exposes it via Windows [pipe]
 The exact interface can be auto-detected, or specified through the --channel flag. Bitrate usually **must** be specified unless auto-detect is supported by the adapter.
 ```
 Usage: canserver <driver> [--channel <channel> --bitrate <bitrate>]
-Example: canserver slcan --bitrate 1000000
+Example: canserver gsusb --bitrate 1000000
 ```
 
 Supported drivers:
