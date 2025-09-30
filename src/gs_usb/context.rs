@@ -10,12 +10,11 @@ use std::time::Duration;
 
 use libusb1_sys as libusb;
 use libusb1_sys::constants::{
-    LIBUSB_CONTROL_SETUP_SIZE, LIBUSB_ENDPOINT_IN, LIBUSB_ERROR_INTERRUPTED,
-    LIBUSB_ERROR_NO_DEVICE, LIBUSB_ERROR_NOT_FOUND, LIBUSB_ERROR_NOT_SUPPORTED, LIBUSB_ERROR_PIPE,
-    LIBUSB_ERROR_TIMEOUT, LIBUSB_TRANSFER_CANCELLED, LIBUSB_TRANSFER_COMPLETED,
-    LIBUSB_TRANSFER_ERROR, LIBUSB_TRANSFER_NO_DEVICE, LIBUSB_TRANSFER_OVERFLOW,
-    LIBUSB_TRANSFER_STALL, LIBUSB_TRANSFER_TIMED_OUT, LIBUSB_TRANSFER_TYPE_BULK,
-    LIBUSB_TRANSFER_TYPE_CONTROL,
+    LIBUSB_CONTROL_SETUP_SIZE, LIBUSB_ERROR_INTERRUPTED, LIBUSB_ERROR_NO_DEVICE,
+    LIBUSB_ERROR_NOT_FOUND, LIBUSB_ERROR_NOT_SUPPORTED, LIBUSB_ERROR_PIPE, LIBUSB_ERROR_TIMEOUT,
+    LIBUSB_TRANSFER_CANCELLED, LIBUSB_TRANSFER_COMPLETED, LIBUSB_TRANSFER_ERROR,
+    LIBUSB_TRANSFER_NO_DEVICE, LIBUSB_TRANSFER_OVERFLOW, LIBUSB_TRANSFER_STALL,
+    LIBUSB_TRANSFER_TIMED_OUT, LIBUSB_TRANSFER_TYPE_BULK, LIBUSB_TRANSFER_TYPE_CONTROL,
 };
 use tokio::sync::oneshot;
 
@@ -119,7 +118,7 @@ impl Drop for LibusbContext {
 /// Wrapper around a libusb device handle, adding async helpers and automatic close semantics.
 #[derive(Clone)]
 pub(crate) struct LibusbDeviceHandle {
-    pub(crate) context: Arc<LibusbContext>,
+    pub(crate) _context: Arc<LibusbContext>,
     handle: Arc<LibusbHandleWrapper>,
 }
 
@@ -145,7 +144,7 @@ impl LibusbDeviceHandle {
             return Err(map_libusb_error(rc));
         }
         Ok(Self {
-            context,
+            _context: context,
             handle: Arc::new(LibusbHandleWrapper(handle)),
         })
     }
@@ -179,6 +178,7 @@ impl LibusbDeviceHandle {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn bulk_write(
         &self,
         endpoint: u8,
@@ -230,6 +230,7 @@ impl LibusbDeviceHandle {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn control_in(
         &self,
         request_type: u8,
@@ -314,6 +315,7 @@ impl LibusbDeviceHandle {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn control_out(
         &self,
         request_type: u8,
@@ -380,6 +382,7 @@ impl LibusbDeviceHandle {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn bulk_read_blocking(
         &self,
         endpoint: u8,

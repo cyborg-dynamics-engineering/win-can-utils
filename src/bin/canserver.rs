@@ -165,7 +165,6 @@ async fn init_gsusb(cli: &Cli) -> std::io::Result<Box<dyn CanDriver>> {
     println!("gs_usb connected to {}", driver.device_label());
 
     driver.set_bitrate(bitrate).await?;
-    // driver.enable_timestamp().await?;
     driver.open_channel().await?;
 
     Ok(Box::new(driver))

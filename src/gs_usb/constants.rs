@@ -14,8 +14,6 @@ pub const GS_TS_LEN: usize = 4; // optional u32 timestamp (RX only)
 pub const GS_MAX_DATA: usize = 64; // max CAN(-FD) payload
 /// Max frame length (RX: header + ts + payload)
 pub const GS_MAX_FRAME_LEN: usize = GS_HEADER_LEN + GS_TS_LEN + GS_MAX_DATA; // 80
-/// Classic CAN TX frame length (header + 8 data bytes)
-pub const GS_CAN_FRAME_LEN: usize = GS_HEADER_LEN + 8; // 20
 pub const GS_TX_FRAME_SIZE: usize = 12 + 64; // 76 bytes, no timestamp on TX
 
 /// Chosen USB bulk read size (in bytes).
@@ -30,44 +28,44 @@ pub const GS_CAN_ECHO_ID_UNUSED: u32 = 0xFFFF_FFFF;
 pub const GS_USB_BREQ_HOST_FORMAT: u8 = 0x00;
 pub const GS_USB_BREQ_BITTIMING: u8 = 0x01;
 pub const GS_USB_BREQ_MODE: u8 = 0x02;
-pub const GS_USB_BREQ_BERR: u8 = 0x03;
+pub const _GS_USB_BREQ_BERR: u8 = 0x03;
 pub const GS_USB_BREQ_BT_CONST: u8 = 0x04;
 pub const GS_USB_BREQ_DEVICE_CONFIG: u8 = 0x05;
 pub const GS_USB_BREQ_TIMESTAMP: u8 = 0x06;
-pub const GS_USB_BREQ_IDENTIFY: u8 = 0x07;
+pub const _GS_USB_BREQ_IDENTIFY: u8 = 0x07;
 // 0x08 GET_USER_ID (rarely used)
 // 0x09 SET_USER_ID
-pub const GS_USB_BREQ_DATA_BITTIMING: u8 = 0x0A;
+pub const _GS_USB_BREQ_DATA_BITTIMING: u8 = 0x0A;
 pub const GS_USB_BREQ_BT_CONST_EXT: u8 = 0x0B;
-pub const GS_USB_BREQ_SET_TERMINATION: u8 = 0x0C;
-pub const GS_USB_BREQ_GET_TERMINATION: u8 = 0x0D;
-pub const GS_USB_BREQ_GET_STATE: u8 = 0x0E;
+pub const _GS_USB_BREQ_SET_TERMINATION: u8 = 0x0C;
+pub const _GS_USB_BREQ_GET_TERMINATION: u8 = 0x0D;
+pub const _GS_USB_BREQ_GET_STATE: u8 = 0x0E;
 
 //
 // gs_can_mode flags
 //
 pub const GS_CAN_MODE_RESET: u32 = 0x0000_0000;
 pub const GS_CAN_MODE_START: u32 = 0x0000_0001;
-pub const GS_CAN_MODE_LOOP_BACK: u32 = 0x0000_0002;
-pub const GS_CAN_MODE_LISTEN_ONLY: u32 = 0x0000_0004;
-pub const GS_CAN_MODE_TRIPLE_SAMPLE: u32 = 0x0000_0008;
-pub const GS_CAN_MODE_ONE_SHOT: u32 = 0x0000_0010;
+pub const _GS_CAN_MODE_LOOP_BACK: u32 = 0x0000_0002;
+pub const _GS_CAN_MODE_LISTEN_ONLY: u32 = 0x0000_0004;
+pub const _GS_CAN_MODE_TRIPLE_SAMPLE: u32 = 0x0000_0008;
+pub const _GS_CAN_MODE_ONE_SHOT: u32 = 0x0000_0010;
 pub const GS_CAN_MODE_HW_TIMESTAMP: u32 = 0x0000_0020;
 pub const GS_CAN_MODE_PAD_PKTS_TO_MAX_PKT_SIZE: u32 = 0x0000_0040;
 
 //
 // gs_can_feature flags (reported by BT_CONST / BT_CONST_EXT)
 //
-pub const GS_CAN_FEATURE_LISTEN_ONLY: u32 = 0x0000_0001;
-pub const GS_CAN_FEATURE_LOOP_BACK: u32 = 0x0000_0002;
-pub const GS_CAN_FEATURE_TRIPLE_SAMPLE: u32 = 0x0000_0004;
-pub const GS_CAN_FEATURE_ONE_SHOT: u32 = 0x0000_0008;
-pub const GS_CAN_FEATURE_HW_TIMESTAMP: u32 = 0x0000_0010;
-pub const GS_CAN_FEATURE_IDENTIFY: u32 = 0x0000_0020;
+pub const _GS_CAN_FEATURE_LISTEN_ONLY: u32 = 0x0000_0001;
+pub const _GS_CAN_FEATURE_LOOP_BACK: u32 = 0x0000_0002;
+pub const _GS_CAN_FEATURE_TRIPLE_SAMPLE: u32 = 0x0000_0004;
+pub const _GS_CAN_FEATURE_ONE_SHOT: u32 = 0x0000_0008;
+pub const _GS_CAN_FEATURE_HW_TIMESTAMP: u32 = 0x0000_0010;
+pub const _GS_CAN_FEATURE_IDENTIFY: u32 = 0x0000_0020;
 pub const GS_CAN_FEATURE_PAD_PKTS_TO_MAX_PKT_SIZE: u32 = 0x0000_0040;
 pub const GS_CAN_FEATURE_FD: u32 = 0x0000_0100;
-pub const GS_CAN_FEATURE_BRS: u32 = 0x0000_0200;
-pub const GS_CAN_FEATURE_EXT_LOOP_BACK: u32 = 0x0000_0400;
+pub const _GS_CAN_FEATURE_BRS: u32 = 0x0000_0200;
+pub const _GS_CAN_FEATURE_EXT_LOOP_BACK: u32 = 0x0000_0400;
 
 //
 // CAN ID flags/masks (as in Linux <linux/can.h>)

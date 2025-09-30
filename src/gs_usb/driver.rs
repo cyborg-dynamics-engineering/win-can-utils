@@ -17,6 +17,240 @@ use super::context::{LibusbContext, LibusbDeviceHandle};
 use super::device::select_device;
 use super::frames::parse_host_frame_at;
 
+/// State owned by the dedicated USB thread.
+///
+/// The gs_usb protocol requires that all libusb operations are serialized from a
+/// single thread.  The thread receives [`UsbCommand`] messages from the async
+/// side and streams incoming CAN frames back through an [`mpsc`] channel.
+struct UsbEventLoop {
+    handle: LibusbDeviceHandle,
+    iface: u8,
+    in_ep: u8,
+    _out_ep: u8,
+    cmd_rx: mpsc::Receiver<UsbCommand>,
+    frame_tx: mpsc::Sender<CanFrame>,
+    rx_buffer: Vec<u8>,
+    last_timestamp64: Option<u64>,
+    channel_index: u8,
+    timestamp_enabled: bool,
+}
+
+impl UsbEventLoop {
+    fn new(
+        handle: LibusbDeviceHandle,
+        iface: u8,
+        in_ep: u8,
+        out_ep: u8,
+        cmd_rx: mpsc::Receiver<UsbCommand>,
+        frame_tx: mpsc::Sender<CanFrame>,
+    ) -> Self {
+        Self {
+            handle,
+            iface,
+            in_ep,
+            _out_ep: out_ep,
+            cmd_rx,
+            frame_tx,
+            rx_buffer: Vec::with_capacity(GS_MAX_FRAME_LEN * 4),
+            last_timestamp64: None,
+            channel_index: 0,
+            timestamp_enabled: false,
+        }
+    }
+
+    async fn run(mut self) -> io::Result<()> {
+        // Keep a dedicated handle reference alive for the in-flight bulk read
+        // future so that we can continue issuing control requests through
+        // `self.handle` while the transfer is pending.
+        let read_handle = self.handle.clone();
+        let mut rx_transfer =
+            Box::pin(read_handle.bulk_read(self.in_ep, USB_READ_BYTES, Duration::ZERO));
+
+        loop {
+            tokio::select! {
+                biased;
+
+                maybe_cmd = self.cmd_rx.recv() => {
+                    let Some(command) = maybe_cmd else {
+                        return Ok(());
+                    };
+
+                    if !self.handle_command(command).await? {
+                        return Ok(());
+                    }
+                }
+
+                result = &mut rx_transfer => {
+                    self.handle_rx_completion(result).await?;
+                    rx_transfer = Box::pin(read_handle.bulk_read(
+                        self.in_ep,
+                        USB_READ_BYTES,
+                        Duration::ZERO,
+                    ));
+                }
+            }
+        }
+    }
+
+    async fn handle_command(&mut self, command: UsbCommand) -> io::Result<bool> {
+        match command {
+            UsbCommand::ControlOut {
+                request_type,
+                request,
+                value,
+                index,
+                data,
+                resp,
+            } => {
+                let result = self.handle.control_out_blocking(
+                    request_type,
+                    request,
+                    value,
+                    index,
+                    &data,
+                    USB_TIMEOUT,
+                );
+
+                if request == GS_USB_BREQ_MODE {
+                    self.channel_index = value as u8;
+                }
+
+                if request == GS_USB_BREQ_TIMESTAMP {
+                    self.timestamp_enabled = data.first().map(|b| *b != 0).unwrap_or(false);
+                }
+
+                let _ = resp.send(result);
+                Ok(true)
+            }
+            UsbCommand::ControlIn {
+                request_type,
+                request,
+                value,
+                index,
+                len,
+                resp,
+            } => {
+                let mut buffer = vec![0u8; len];
+                let result = self
+                    .handle
+                    .control_in_blocking(
+                        request_type,
+                        request,
+                        value,
+                        index,
+                        &mut buffer,
+                        USB_TIMEOUT,
+                    )
+                    .map(|written| {
+                        buffer.truncate(written);
+                        buffer
+                    });
+                let _ = resp.send(result);
+                Ok(true)
+            }
+            UsbCommand::BulkWrite {
+                endpoint,
+                data,
+                resp,
+            } => {
+                let result = self.bulk_write(endpoint, data).await;
+                let _ = resp.send(result);
+                Ok(true)
+            }
+            UsbCommand::Shutdown {} => Ok(false),
+        }
+    }
+
+    async fn handle_rx_completion(&mut self, result: io::Result<Vec<u8>>) -> io::Result<()> {
+        match result {
+            Ok(chunk) => self.process_rx_chunk(&chunk).await,
+            Err(error) if error.kind() == io::ErrorKind::NotConnected => Err(error),
+            Err(_) => {
+                let _ = self.handle.clear_halt(self.in_ep);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                Ok(())
+            }
+        }
+    }
+
+    async fn process_rx_chunk(&mut self, chunk: &[u8]) -> io::Result<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+
+        self.rx_buffer.extend_from_slice(chunk);
+
+        let mut offset = 0usize;
+        while self.rx_buffer.len() >= offset + GS_HEADER_LEN {
+            let slice = &self.rx_buffer[offset..];
+            match parse_host_frame_at(
+                slice,
+                self.channel_index,
+                self.timestamp_enabled,
+                &mut self.last_timestamp64,
+            ) {
+                None => break,
+                Some((maybe_frame, consumed)) => {
+                    if let Some(frame) = maybe_frame {
+                        let _ = self.frame_tx.send(frame).await;
+                    }
+                    offset += consumed;
+                }
+            }
+        }
+
+        if offset > 0 {
+            self.rx_buffer.drain(..offset);
+        }
+
+        Ok(())
+    }
+
+    async fn bulk_write(&mut self, endpoint: u8, data: Vec<u8>) -> io::Result<usize> {
+        const TX_TIMEOUT: Duration = Duration::from_millis(5);
+
+        let result = self.handle.bulk_write_blocking(endpoint, data, TX_TIMEOUT);
+
+        if let Err(error) = &result {
+            match error.kind() {
+                io::ErrorKind::WouldBlock | io::ErrorKind::BrokenPipe => {
+                    let _ = self.handle.clear_halt(endpoint);
+                    if error.kind() == io::ErrorKind::BrokenPipe {
+                        self.recover_after_stall().await?;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        result
+    }
+
+    async fn recover_after_stall(&mut self) -> io::Result<()> {
+        let reset = encode_mode(GS_CAN_MODE_RESET, 0);
+        self.handle.control_out_blocking(
+            request_type_out(),
+            GS_USB_BREQ_MODE,
+            self.channel_index as u16,
+            self.iface as u16,
+            &reset,
+            Duration::from_millis(50),
+        )?;
+
+        let start = encode_mode(GS_CAN_MODE_START, 0);
+        self.handle.control_out_blocking(
+            request_type_out(),
+            GS_USB_BREQ_MODE,
+            self.channel_index as u16,
+            self.iface as u16,
+            &start,
+            Duration::from_millis(50),
+        )?;
+
+        Ok(())
+    }
+}
+
 /// Commands sent to the USB event loop thread.
 enum UsbCommand {
     ControlOut {
@@ -40,6 +274,7 @@ enum UsbCommand {
         data: Vec<u8>,
         resp: oneshot::Sender<io::Result<usize>>,
     },
+    #[allow(dead_code)]
     Shutdown,
 }
 
@@ -47,17 +282,15 @@ enum UsbCommand {
 pub struct GsUsbDriver {
     // device info
     interface: u8,
-    in_ep: u8,
+    _in_ep: u8,
     out_ep: u8,
-    int_ep: Option<u8>,
+    _int_ep: Option<u8>,
     channel_index: u8,
     device_label: String,
 
     // state
     configured_bitrate: Option<u32>,
     timestamp_enabled: bool,
-    last_timestamp64: Option<u64>,
-    rx_leftover: Vec<u8>,
     tx_counter: AtomicU32,
 
     // feature discovery
@@ -80,7 +313,7 @@ impl GsUsbDriver {
         handle.claim_interface(info.interface as i32)?;
 
         // Channel: event loop <-> driver commands
-        let (cmd_tx, mut cmd_rx) = mpsc::channel::<UsbCommand>(128);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<UsbCommand>(128);
 
         // Channel: frames to async side
         let (frame_tx, frame_rx) = mpsc::channel::<CanFrame>(1024);
@@ -88,16 +321,14 @@ impl GsUsbDriver {
         // Driver instance
         let mut driver = GsUsbDriver {
             interface: info.interface,
-            in_ep: info.in_ep,
+            _in_ep: info.in_ep,
             out_ep: info.out_ep,
-            int_ep: info.int_ep,
+            _int_ep: info.int_ep,
             channel_index: 0,
             device_label: label,
 
             configured_bitrate: None,
             timestamp_enabled: false,
-            last_timestamp64: None,
-            rx_leftover: Vec::with_capacity(GS_MAX_FRAME_LEN * 4),
             tx_counter: AtomicU32::new(0),
 
             features: 0,
@@ -108,196 +339,25 @@ impl GsUsbDriver {
             cmd_tx: cmd_tx.clone(),
         };
 
-        // Spawn the single-owner USB event loop thread.
-        // It owns `handle` and serializes ALL libusb operations.
-        let iface = info.interface;
-        let in_ep = info.in_ep;
-        let out_ep = info.out_ep;
-
-        eprintln!(
-            "[dev] iface={} out_ep=0x{:02X} in_ep=0x{:02X} int_ep={:?} wMaxOut={}",
-            driver.interface, driver.out_ep, driver.in_ep, driver.int_ep, driver.out_wmax
-        );
-
+        // Spawn the single-owner USB event loop thread. It owns `handle` and
+        // serializes all libusb access behind the [`UsbCommand`] channel.
         std::thread::spawn(move || {
-            let res = catch_unwind(AssertUnwindSafe(move || {
-                // Run an async loop in this thread.
-                let rt = tokio::runtime::Builder::new_current_thread()
+            let _ = catch_unwind(AssertUnwindSafe(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .expect("tokio rt");
+                    .expect("tokio runtime");
 
-                rt.block_on(async move {
-            let mut rx_leftover = Vec::with_capacity(GS_MAX_FRAME_LEN * 4);
-            let mut last_ts64: Option<u64> = None;
-            let mut channel_index: u8 = 0;
-            let mut timestamp_enabled = false;
-
-            // Helper: robust write with short timeout and recovery (kept blocking; cheap)
-            let mut consecutive_tx_timeouts = 0usize;
-            let mut tx_write = |data: Vec<u8>| -> io::Result<usize> {
-                const TX_TIMEOUT_MS: u64 = 5;
-                let r = handle.bulk_write_blocking(
-                    out_ep,
-                    data,
-                    Duration::from_millis(TX_TIMEOUT_MS),
+                let event_loop = UsbEventLoop::new(
+                    handle,
+                    info.interface,
+                    info.in_ep,
+                    info.out_ep,
+                    cmd_rx,
+                    frame_tx,
                 );
-                match &r {
-                    Ok(_) => consecutive_tx_timeouts = 0,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        consecutive_tx_timeouts += 1;
-                        if consecutive_tx_timeouts == 3 {
-                            let _ = handle.clear_halt(out_ep);
-                        }
-                        if consecutive_tx_timeouts == 5 {
-                            // Nudge device: RESET -> START on current channel/interface
-                            let reset = encode_mode(GS_CAN_MODE_RESET, 0);
-                            let _ = handle.control_out_blocking(
-                                request_type_out(),
-                                GS_USB_BREQ_MODE,
-                                channel_index as u16, // wValue = channel
-                                iface as u16,         // wIndex = interface
-                                &reset,
-                                Duration::from_millis(50),
-                            );
-                            let start = encode_mode(GS_CAN_MODE_START, 0);
-                            let _ = handle.control_out_blocking(
-                                request_type_out(),
-                                GS_USB_BREQ_MODE,
-                                channel_index as u16,
-                                iface as u16,
-                                &start,
-                                Duration::from_millis(50),
-                            );
-                        }
-                    }
-                    Err(_) => {}
-                }
-                r
-            };
-
-            // Prime one asynchronous RX transfer.
-            // Duration::ZERO => no timeout; completion is driven by the libusb event thread.
-            let mut rx_fut = Box::pin(handle.bulk_read(in_ep, USB_READ_BYTES, Duration::ZERO));
-
-            loop {
-                tokio::select! {
-                    // Prioritize driver commands
-                    biased;
-
-                    maybe_cmd = cmd_rx.recv() => {
-                        let Some(cmd) = maybe_cmd else {
-                            // Command channel closed: exit the thread
-                            return;
-                        };
-                        match cmd {
-                            UsbCommand::ControlOut { request_type, request, value, index, data, resp } => {
-                                let r = handle.control_out_blocking(
-                                    request_type, request, value, index, &data, USB_TIMEOUT
-                                );
-                                let _ = resp.send(r);
-                            }
-                            UsbCommand::ControlIn { request_type, request, value, index, len, resp } => {
-                                let mut buf = vec![0u8; len];
-                                let r = handle.control_in_blocking(
-                                    request_type, request, value, index, &mut buf, USB_TIMEOUT
-                                ).map(|n| { buf.truncate(n); buf });
-                                let _ = resp.send(r);
-                            }
-                            UsbCommand::BulkWrite { endpoint, data, resp } => {
-                                const TX_TIMEOUT: Duration = Duration::from_millis(5);
-                                let r = handle.bulk_write_blocking(endpoint, data.clone(), TX_TIMEOUT);
-                                if let Err(e) = &r {
-                                    match e.kind() {
-                                        io::ErrorKind::WouldBlock => {
-                                            let _ = handle.clear_halt(endpoint);
-                                        }
-                                        io::ErrorKind::BrokenPipe => {
-                                            let _ = handle.clear_halt(endpoint);
-                                            // Re-sync MODE on pipe stall
-                                            let reset = encode_mode(GS_CAN_MODE_RESET, 0);
-                                            let _ = handle.control_out_blocking(
-                                                request_type_out(),
-                                                GS_USB_BREQ_MODE,
-                                                channel_index as u16,
-                                                iface as u16,
-                                                &reset,
-                                                Duration::from_millis(50),
-                                            );
-                                            let start = encode_mode(GS_CAN_MODE_START, 0);
-                                            let _ = handle.control_out_blocking(
-                                                request_type_out(),
-                                                GS_USB_BREQ_MODE,
-                                                channel_index as u16,
-                                                iface as u16,
-                                                &start,
-                                                Duration::from_millis(50),
-                                            );
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                let _ = resp.send(r);
-                            }
-                            UsbCommand::Shutdown => {
-                                // Graceful exit
-                                return;
-                            }
-                        }
-                    }
-
-                    rx_res = &mut rx_fut => {
-                        match rx_res {
-                            Ok(chunk) if !chunk.is_empty() => {
-                                // Reassemble and forward frames
-                                rx_leftover.extend_from_slice(&chunk);
-                                let mut offset = 0usize;
-                                while rx_leftover.len() >= offset + GS_HEADER_LEN {
-                                    let slice = &rx_leftover[offset..];
-                                    match parse_host_frame_at(
-                                        slice,
-                                        channel_index,
-                                        timestamp_enabled,
-                                        &mut last_ts64,
-                                    ) {
-                                        None => break,
-                                        Some((maybe_frame, consumed)) => {
-                                            if let Some(frame) = maybe_frame {
-                                                // Use async send to avoid blocking this thread
-                                                let _ = frame_tx.send(frame).await;
-                                            }
-                                            offset += consumed;
-                                        }
-                                    }
-                                }
-                                if offset > 0 {
-                                    rx_leftover.drain(..offset);
-                                }
-                            }
-                            Ok(_) => { /* 0-byte (rare) -> ignore */ }
-                            Err(e) => {
-                                // Try to recover; exit if device is gone
-                                if e.kind() == io::ErrorKind::NotConnected {
-                                    return;
-                                }
-                                let _ = handle.clear_halt(in_ep);
-                                // small backoff to avoid hot looping on persistent errors
-                                tokio::time::sleep(Duration::from_millis(5)).await;
-                            }
-                        }
-
-                        // Immediately re-arm the RX transfer
-                        rx_fut = Box::pin(handle.bulk_read(in_ep, USB_READ_BYTES, Duration::ZERO));
-                    }
-                }
-            }
-        });
+                let _ = runtime.block_on(event_loop.run());
             }));
-
-            match res {
-                Ok(()) => eprintln!("[usb-event-loop] exited normally"),
-                Err(_) => eprintln!("[usb-event-loop] PANIC: thread unwound"),
-            }
         });
 
         // === Handshake & feature discovery (through the event loop) ===
@@ -421,24 +481,9 @@ impl GsUsbDriver {
             ));
         }
 
-        if buf.len() < 8 {
-            eprintln!(
-                "[warn] device_config returned {} bytes (expected 8), assuming legacy fw",
-                buf.len()
-            );
-        }
-
-        if buf.len() < 8 {
-            eprintln!(
-                "[warn] device_config returned {} bytes (expected 8), assuming legacy fw (classic CAN only)",
-                buf.len()
-            );
-        } else {
-            eprintln!("[info] device_config OK (supports FD/76-byte frames)");
-        }
-
         let mut arr = [0u8; 8];
-        arr[..buf.len()].copy_from_slice(&buf);
+        let available = buf.len().min(arr.len());
+        arr[..available].copy_from_slice(&buf[..available]);
         Ok(arr)
     }
 
@@ -474,6 +519,7 @@ impl GsUsbDriver {
         Ok(u32::from_le_bytes(b.try_into().unwrap()))
     }
 
+    #[allow(dead_code)]
     async fn send_control(&self, request: u8, data: &[u8]) -> io::Result<()> {
         let written = self
             .cmd_control_out(request_type_out(), request, 0, 0, data.to_vec())
@@ -490,19 +536,9 @@ impl GsUsbDriver {
     fn encode_frame_auto(&self, frame: &CanFrame) -> Vec<u8> {
         // If the device reports CAN-FD support, use 76-byte frames
         if self.features & GS_CAN_FEATURE_FD != 0 {
-            let buf = self.encode_frame_tx_76(frame);
-            eprintln!(
-                "[encode_frame_auto][FD] echo_id={} len={} raw_first4={:02X?}",
-                self.tx_counter
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .wrapping_sub(1),
-                buf.len(),
-                &buf[0..4]
-            );
-            buf
+            self.encode_frame_tx_76(frame)
         } else {
-            let buf = self.encode_frame_minimal(frame);
-            buf
+            self.encode_frame_minimal(frame)
         }
     }
 
@@ -512,12 +548,6 @@ impl GsUsbDriver {
         // echo_id: rotating 0..15
         let echo_id = self.tx_counter.fetch_add(1, Ordering::Relaxed) % 16;
         buf[0..4].copy_from_slice(&(echo_id as u32).to_le_bytes());
-
-        eprintln!(
-            "[encode_frame_tx_76][debug] echo_id={} raw={:02X?}",
-            echo_id,
-            &buf[0..4]
-        );
 
         // can_id (+flags)
         let mut can_id = if frame.is_extended() {
@@ -598,34 +628,16 @@ impl GsUsbDriver {
                 Ok(written) if written == buffer.len() => {
                     return Ok(());
                 }
-                Ok(written) => {
-                    eprintln!(
-                        "[send_frame][warn] short write: {} / {} bytes",
-                        written, GS_TX_FRAME_SIZE
-                    );
+                Ok(_) => {
                     return Err(io::Error::new(
                         io::ErrorKind::Other,
                         "incomplete bulk write",
                     ));
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    eprintln!(
-                        "[send_frame][retry] WouldBlock rc=-7, endpoint=0x{:02X}, len={}, err={:?}",
-                        self.out_ep,
-                        buffer.len(),
-                        err
-                    );
                     sleep(USB_WRITE_RETRY_DELAY).await;
                 }
-                Err(err) => {
-                    eprintln!(
-                        "[send_frame][error] endpoint=0x{:02X}, len={}, err={:?}",
-                        self.out_ep,
-                        buffer.len(),
-                        err
-                    );
-                    return Err(err);
-                }
+                Err(err) => return Err(err),
             }
         }
     }
@@ -661,7 +673,7 @@ impl GsUsbDriver {
     }
 
     async fn close_channel_inner(&mut self) -> io::Result<()> {
-        let reset = encode_mode(GS_CAN_MODE_RESET, 0);
+        let _reset = encode_mode(GS_CAN_MODE_RESET, 0);
 
         self.cmd_control_out(
             request_type_out(),
@@ -677,15 +689,6 @@ impl GsUsbDriver {
     pub fn device_label(&self) -> &str {
         &self.device_label
     }
-}
-
-fn bulk_write_zlp_blocking(
-    handle: &LibusbDeviceHandle,
-    endpoint: u8,
-    timeout: Duration,
-) -> io::Result<usize> {
-    // libusb allows zero-length bulk OUT transfers to send a ZLP
-    handle.bulk_write_blocking(endpoint, Vec::new(), timeout)
 }
 
 #[async_trait]
