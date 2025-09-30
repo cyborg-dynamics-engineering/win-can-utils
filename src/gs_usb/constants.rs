@@ -6,7 +6,7 @@ use std::time::Duration;
 /// Default timeout for most USB operations against gs_usb devices.
 pub const USB_TIMEOUT: Duration = Duration::from_millis(5);
 /// Delay between retries when a bulk write times out.
-pub const USB_WRITE_RETRY_DELAY: Duration = Duration::from_millis(1);
+pub const _USB_WRITE_RETRY_DELAY: Duration = Duration::from_millis(1);
 
 /// Header and data sizes
 pub const GS_HEADER_LEN: usize = 12; // echo_id(4) + can_id(4) + dlc(1) + chan(1) + flags(1) + res(1)
@@ -44,14 +44,14 @@ pub const _GS_USB_BREQ_GET_STATE: u8 = 0x0E;
 //
 // gs_can_mode flags
 //
-pub const GS_CAN_MODE_RESET: u32 = 0x0000_0000;
-pub const GS_CAN_MODE_START: u32 = 0x0000_0001;
-pub const _GS_CAN_MODE_LOOP_BACK: u32 = 0x0000_0002;
-pub const _GS_CAN_MODE_LISTEN_ONLY: u32 = 0x0000_0004;
-pub const _GS_CAN_MODE_TRIPLE_SAMPLE: u32 = 0x0000_0008;
-pub const _GS_CAN_MODE_ONE_SHOT: u32 = 0x0000_0010;
-pub const GS_CAN_MODE_HW_TIMESTAMP: u32 = 0x0000_0020;
-pub const GS_CAN_MODE_PAD_PKTS_TO_MAX_PKT_SIZE: u32 = 0x0000_0040;
+pub const GS_CAN_MODE_RESET: u32 = 0;
+pub const GS_CAN_MODE_START: u32 = 1;
+pub const GS_CAN_MODE_LISTEN_ONLY: u32 = 1 << 1; // 0x02
+pub const _GS_CAN_MODE_LOOP_BACK: u32 = 1 << 2; // 0x04
+pub const _GS_CAN_MODE_TRIPLE_SAMPLE: u32 = 1 << 3;
+pub const _GS_CAN_MODE_ONE_SHOT: u32 = 1 << 4;
+pub const GS_CAN_MODE_HW_TIMESTAMP: u32 = 1 << 5;
+pub const GS_CAN_MODE_PAD_PKTS_TO_MAX_PKT_SIZE: u32 = 1 << 6;
 
 //
 // gs_can_feature flags (reported by BT_CONST / BT_CONST_EXT)

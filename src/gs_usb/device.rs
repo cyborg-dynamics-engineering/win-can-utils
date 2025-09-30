@@ -15,9 +15,11 @@ use super::context::{
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InterfaceInfo {
     pub(crate) interface: u8,
+    pub(crate) alt_setting: u8,
     pub(crate) in_ep: u8,
     pub(crate) out_ep: u8,
     pub(crate) int_ep: Option<u8>,
+    pub(crate) out_wmax: u16,
 }
 
 struct ConfigDescriptor(*const libusb::libusb_config_descriptor);
@@ -65,36 +67,42 @@ unsafe fn find_gs_usb_interface(
     for interface_index in 0..interface_count {
         let interface = unsafe { &*(*config_ptr).interface.add(interface_index as usize) };
         for alt_index in 0..interface.num_altsetting as usize {
-            let descriptor = unsafe { &*interface.altsetting.add(alt_index) };
-            if descriptor.bInterfaceClass != 0xff {
-                continue;
-            }
-            let mut info = InterfaceInfo {
-                interface: descriptor.bInterfaceNumber,
-                in_ep: 0,
-                out_ep: 0,
-                int_ep: None,
-            };
-            for ep_index in 0..descriptor.bNumEndpoints as usize {
-                let endpoint = unsafe { &*descriptor.endpoint.add(ep_index) };
-                match endpoint.bmAttributes & 0x3 {
-                    x if x == LIBUSB_TRANSFER_TYPE_BULK => {
+            unsafe {
+                let descriptor = &*interface.altsetting.add(alt_index);
+                if descriptor.bInterfaceClass != 0xff {
+                    continue;
+                }
+
+                let mut info = InterfaceInfo {
+                    interface: descriptor.bInterfaceNumber,
+                    alt_setting: descriptor.bAlternateSetting, // ← capture it
+                    in_ep: 0,
+                    out_ep: 0,
+                    int_ep: None,
+                    out_wmax: 64,
+                };
+
+                for ep_index in 0..descriptor.bNumEndpoints as usize {
+                    let endpoint = &*descriptor.endpoint.add(ep_index);
+                    let xfer_type = endpoint.bmAttributes & 0x3;
+
+                    if xfer_type == LIBUSB_TRANSFER_TYPE_BULK {
                         if endpoint.bEndpointAddress & LIBUSB_ENDPOINT_IN != 0 {
                             info.in_ep = endpoint.bEndpointAddress;
                         } else {
                             info.out_ep = endpoint.bEndpointAddress;
+                            info.out_wmax = endpoint.wMaxPacketSize;
                         }
-                    }
-                    x if x == LIBUSB_TRANSFER_TYPE_INTERRUPT => {
+                    } else if xfer_type == LIBUSB_TRANSFER_TYPE_INTERRUPT {
                         if endpoint.bEndpointAddress & LIBUSB_ENDPOINT_IN != 0 {
                             info.int_ep = Some(endpoint.bEndpointAddress);
                         }
                     }
-                    _ => {}
                 }
-            }
-            if info.in_ep != 0 && info.out_ep != 0 {
-                return Ok(Some(info));
+
+                if info.in_ep != 0 && info.out_ep != 0 {
+                    return Ok(Some(info)); // ← pick THIS altsetting
+                }
             }
         }
     }
@@ -205,6 +213,14 @@ pub(crate) fn select_device(
     }
 
     if let Some((handle, info, label)) = result {
+        log::info!(
+            "Selected gs_usb iface={} in_ep=0x{:02x} out_ep=0x{:02x} int_ep={:?} out_wmax={}",
+            info.interface,
+            info.in_ep,
+            info.out_ep,
+            info.int_ep,
+            info.out_wmax
+        );
         return Ok((handle, info, label));
     }
 

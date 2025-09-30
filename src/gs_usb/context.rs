@@ -427,7 +427,6 @@ impl LibusbDeviceHandle {
             )
         };
         if rc < 0 {
-            eprintln!("[usb] bulk_write_blocking error: rc={rc}");
             return Err(map_libusb_error(rc));
         }
         Ok(transferred as usize)
