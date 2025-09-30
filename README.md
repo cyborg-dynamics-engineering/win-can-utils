@@ -1,6 +1,6 @@
 # Windows CAN Utils
 
-This project aims to provide a Windows equivalent of [can-utils](https://github.com/linux-can/can-utils), offering CLI tools for interacting with CAN devices via USB-to-CAN transceivers. It currently supports slcan adapters, including the DSD Tech [SH-C30A](https://www.deshide.com/product-details_SH-C30A.html) and [SH-C31A](https://www.deshide.com/product-details_SH-C31A.html), both of which are widely available on Amazon for under $20 USD. More devices may be added in the future.
+This project aims to provide a Windows equivalent of [can-utils](https://github.com/linux-can/can-utils), offering CLI tools for interacting with CAN devices via USB-to-CAN transceivers. It currently supports canable adapters and pcan adapters. The canable adapter best supported are the DSD Tech [SH-C30A](https://www.deshide.com/product-details_SH-C30A.html) and [SH-C31A](https://www.deshide.com/product-details_SH-C31A.html), both of which are widely available on Amazon for under $20 USD.
 
 ## Table of Contents
 - [Windows CAN Utils](#windows-can-utils)
