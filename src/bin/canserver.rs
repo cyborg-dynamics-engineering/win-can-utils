@@ -165,6 +165,7 @@ async fn init_gsusb(cli: &Cli) -> std::io::Result<Box<dyn CanDriver>> {
     println!("gs_usb connected to {}", driver.device_label());
 
     driver.set_bitrate(bitrate).await?;
+    // driver.enable_timestamp().await?;
     driver.open_channel().await?;
 
     Ok(Box::new(driver))
@@ -172,6 +173,7 @@ async fn init_gsusb(cli: &Cli) -> std::io::Result<Box<dyn CanDriver>> {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    env_logger::init();
     let cli = Cli::parse();
 
     // Initialize the specified driver.
@@ -223,7 +225,6 @@ async fn main() -> std::io::Result<()> {
                 if let Err(e) = d.send_frame(&frame).await {
                     eprintln!("Failed to send CAN frame: {:?}", e);
                 }
-                println!("Sent");
             }
         }
         // channel closed → exit loop

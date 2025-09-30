@@ -1,15 +1,15 @@
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::can_driver::CanDriver;
+use crate::gs_usb::bit_timing::{GsBtConst, parse_bt_const};
+use crate::gs_usb::context::map_libusb_error;
 use async_trait::async_trait;
 use crosscan::can::CanFrame;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::sleep;
-
-use crate::can_driver::CanDriver;
 
 use super::bit_timing::{calc_bit_timing, encode_mode};
 use super::constants::*;
@@ -17,6 +17,7 @@ use super::context::{LibusbContext, LibusbDeviceHandle};
 use super::device::select_device;
 use super::frames::parse_host_frame_at;
 
+use log::{debug, error, info, warn};
 /// State owned by the dedicated USB thread.
 ///
 /// The gs_usb protocol requires that all libusb operations are serialized from a
@@ -207,7 +208,7 @@ impl UsbEventLoop {
     }
 
     async fn bulk_write(&mut self, endpoint: u8, data: Vec<u8>) -> io::Result<usize> {
-        const TX_TIMEOUT: Duration = Duration::from_millis(5);
+        const TX_TIMEOUT: Duration = Duration::from_millis(20);
 
         let result = self.handle.bulk_write_blocking(endpoint, data, TX_TIMEOUT);
 
@@ -294,13 +295,15 @@ pub struct GsUsbDriver {
     tx_counter: AtomicU32,
 
     // feature discovery
-    features: u32,  // feature bitmask from BT_CONST(_EXT)
-    out_wmax: u16,  // OUT endpoint wMaxPacketSize (e.g., 32)
-    pad_pkts: bool, // true if device wants padding
+    features: u32,             // feature bitmask from BT_CONST(_EXT)
+    out_wmax: u16,             // OUT endpoint wMaxPacketSize (e.g., 32)
+    pad_pkts: Arc<AtomicBool>, // true if device wants padding
 
     // async integration
     frame_rx: Arc<Mutex<mpsc::Receiver<CanFrame>>>,
     cmd_tx: mpsc::Sender<UsbCommand>, // to USB event loop
+
+    bt_const: Option<GsBtConst>,
 }
 
 impl GsUsbDriver {
@@ -309,8 +312,28 @@ impl GsUsbDriver {
         let context = LibusbContext::new()?;
         let (handle, info, label) = select_device(&context, identifier)?;
 
+        info!("OUT endpoint wMaxPacketSize = {}", info.out_wmax);
+
         let _ = handle.set_auto_detach_kernel_driver(true);
         handle.claim_interface(info.interface as i32)?;
+
+        let rc = unsafe {
+            libusb1_sys::libusb_set_interface_alt_setting(
+                handle.raw(), // or expose raw pointer in your wrapper
+                info.interface as i32,
+                info.alt_setting as i32,
+            )
+        };
+
+        if rc < 0 {
+            return Err(map_libusb_error(rc));
+        }
+
+        log::info!(
+            "Using interface {} alt_setting {}",
+            info.interface,
+            info.alt_setting
+        );
 
         // Channel: event loop <-> driver commands
         let (cmd_tx, cmd_rx) = mpsc::channel::<UsbCommand>(128);
@@ -332,11 +355,13 @@ impl GsUsbDriver {
             tx_counter: AtomicU32::new(0),
 
             features: 0,
-            out_wmax: 32, // candleLight FS devices: 32-byte packets
-            pad_pkts: false,
+            out_wmax: info.out_wmax, // candleLight FS devices: 32-byte packets
+            pad_pkts: Arc::new(AtomicBool::new(false)), // <-- start false, will adjust later
 
             frame_rx: Arc::new(Mutex::new(frame_rx)),
             cmd_tx: cmd_tx.clone(),
+
+            bt_const: None,
         };
 
         // Spawn the single-owner USB event loop thread. It owns `handle` and
@@ -362,13 +387,102 @@ impl GsUsbDriver {
 
         // === Handshake & feature discovery (through the event loop) ===
         driver.send_host_format().await?;
+
+        let bt = driver.read_bt_const().await?;
+        driver.features = bt.feature;
+        driver.bt_const = Some(bt);
+        driver.out_wmax = info.out_wmax;
+
         let _dev_conf = driver.read_device_config().await?; // validates comms
         let features = driver.read_features().await.unwrap_or(0);
         driver.features = features;
-        driver.out_wmax = 32; // from your descriptor dump
-        driver.pad_pkts = (features & GS_CAN_FEATURE_PAD_PKTS_TO_MAX_PKT_SIZE) != 0;
+        info!("Features bitmask: {:#010x}", features);
+        driver.out_wmax = info.out_wmax;
+
+        driver.pad_pkts = Arc::new(AtomicBool::new(
+            (features & GS_CAN_FEATURE_PAD_PKTS_TO_MAX_PKT_SIZE) != 0,
+        ));
+
+        log::info!(
+            "CAN init: features={:#010x} out_wmax={} pad_pkts_fw={} bitrate={:?}",
+            driver.features,
+            driver.out_wmax,
+            driver.pad_pkts.load(Ordering::Relaxed),
+            driver.configured_bitrate
+        );
 
         Ok(driver)
+    }
+
+    pub async fn open_listen_only(&mut self) -> io::Result<()> {
+        if self.configured_bitrate.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "set_bitrate() must be called before open_listen_only()",
+            ));
+        }
+        self.open_channel_with_flags(Some(GS_CAN_MODE_LISTEN_ONLY))
+            .await
+    }
+
+    async fn open_channel_with_flags(&mut self, extra_flags: Option<u32>) -> io::Result<()> {
+        let mut flags = 0u32;
+        if self.timestamp_enabled {
+            flags |= GS_CAN_MODE_HW_TIMESTAMP;
+        }
+
+        // 🔧 TEMP: disable PAD_PKTS while diagnosing (flip to true after TX path verified)
+        let enable_pad_pkts = true; // device wants 32-byte aligned
+        if enable_pad_pkts && self.pad_pkts.load(Ordering::Relaxed) {
+            flags |= GS_CAN_MODE_PAD_PKTS_TO_MAX_PKT_SIZE;
+        }
+
+        if let Some(f) = extra_flags {
+            flags |= f;
+        }
+
+        log::debug!(
+            "Opening channel {}, iface={}, flags={:#010x}",
+            self.channel_index,
+            self.interface,
+            flags
+        );
+
+        // Clean RESET → START
+        self.cmd_control_out(
+            request_type_out(),
+            GS_USB_BREQ_MODE,
+            self.channel_index as u16,
+            self.interface as u16,
+            encode_mode(GS_CAN_MODE_RESET, 0).to_vec(),
+        )
+        .await?;
+        log::debug!(" → Sent MODE RESET");
+
+        self.cmd_control_out(
+            request_type_out(),
+            GS_USB_BREQ_MODE,
+            self.channel_index as u16,
+            self.interface as u16,
+            encode_mode(GS_CAN_MODE_START, flags).to_vec(),
+        )
+        .await?;
+        log::debug!(" → Sent MODE START (flags={:#010x})", flags);
+
+        Ok(())
+    }
+
+    fn maybe_pad_tx(&self, mut buf: Vec<u8>) -> Vec<u8> {
+        if self.pad_pkts.load(Ordering::Relaxed) {
+            let m = self.out_wmax as usize;
+            if m > 0 {
+                let rem = buf.len() % m;
+                if rem != 0 {
+                    buf.resize(buf.len() + (m - rem), 0);
+                }
+            }
+        }
+        buf
     }
 
     // === Command helpers that talk to the event loop ===
@@ -381,6 +495,14 @@ impl GsUsbDriver {
         index: u16,
         data: Vec<u8>,
     ) -> io::Result<usize> {
+        debug!(
+            "ControlOut req={:#04x}, val={:#06x}, idx={:#06x}, len={}, data={:02x?}",
+            request,
+            value,
+            index,
+            data.len(),
+            &data
+        );
         let (resp_tx, resp_rx) = oneshot::channel();
         self.cmd_tx
             .send(UsbCommand::ControlOut {
@@ -393,9 +515,11 @@ impl GsUsbDriver {
             })
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "USB event loop closed"))?;
-        resp_rx
+        let res = resp_rx
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "USB event loop dropped"))?
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "USB event loop dropped"))?;
+        debug!(" → ControlOut result: {:?}", res);
+        res
     }
 
     async fn cmd_control_in(
@@ -406,6 +530,11 @@ impl GsUsbDriver {
         index: u16,
         len: usize,
     ) -> io::Result<Vec<u8>> {
+        debug!(
+            "ControlIn → req={:#04x}, val={:#06x}, idx={:#06x}, len={}",
+            request, value, index, len
+        );
+
         let (resp_tx, resp_rx) = oneshot::channel();
         self.cmd_tx
             .send(UsbCommand::ControlIn {
@@ -417,10 +546,28 @@ impl GsUsbDriver {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "USB event loop closed"))?;
-        resp_rx
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "USB event loop dropped"))?
+            .map_err(|_| {
+                error!("ControlIn → USB event loop closed before send");
+                io::Error::new(io::ErrorKind::Other, "USB event loop closed")
+            })?;
+
+        match resp_rx.await {
+            Ok(Ok(buf)) => {
+                debug!("ControlIn ← got {} bytes: {:02x?}", buf.len(), &buf);
+                Ok(buf)
+            }
+            Ok(Err(e)) => {
+                error!("ControlIn ← error: {}", e);
+                Err(e)
+            }
+            Err(_) => {
+                error!("ControlIn ← USB event loop dropped before response");
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "USB event loop dropped",
+                ))
+            }
+        }
     }
 
     async fn cmd_bulk_write(&self, endpoint: u8, data: Vec<u8>) -> io::Result<usize> {
@@ -484,7 +631,39 @@ impl GsUsbDriver {
         let mut arr = [0u8; 8];
         let available = buf.len().min(arr.len());
         arr[..available].copy_from_slice(&buf[..available]);
+        info!("Device config raw: {:02x?}", arr);
         Ok(arr)
+    }
+
+    async fn read_bt_const(&self) -> io::Result<GsBtConst> {
+        match self
+            .cmd_control_in(
+                request_type_in(),
+                GS_USB_BREQ_BT_CONST_EXT,
+                0,
+                self.interface as u16,
+                52,
+            )
+            .await
+        {
+            Ok(buf) if buf.len() >= 40 => return Ok(parse_bt_const(&buf[..40])),
+            Ok(_) => warn!("BT_CONST_EXT short, falling back to BT_CONST"),
+            Err(e) => warn!("BT_CONST_EXT not supported, falling back: {}", e),
+        }
+
+        let buf = self
+            .cmd_control_in(
+                request_type_in(),
+                GS_USB_BREQ_BT_CONST,
+                0,
+                self.interface as u16,
+                40,
+            )
+            .await?;
+        if buf.len() < 40 {
+            return Err(io::Error::new(io::ErrorKind::Other, "BT_CONST short read"));
+        }
+        Ok(parse_bt_const(&buf[..40]))
     }
 
     async fn read_features(&self) -> io::Result<u32> {
@@ -516,6 +695,7 @@ impl GsUsbDriver {
         if b.len() != 4 {
             return Err(io::Error::new(io::ErrorKind::Other, "bt_const short read"));
         }
+
         Ok(u32::from_le_bytes(b.try_into().unwrap()))
     }
 
@@ -531,15 +711,6 @@ impl GsUsbDriver {
             ));
         }
         Ok(())
-    }
-
-    fn encode_frame_auto(&self, frame: &CanFrame) -> Vec<u8> {
-        // If the device reports CAN-FD support, use 76-byte frames
-        if self.features & GS_CAN_FEATURE_FD != 0 {
-            self.encode_frame_tx_76(frame)
-        } else {
-            self.encode_frame_minimal(frame)
-        }
     }
 
     fn encode_frame_tx_76(&self, frame: &CanFrame) -> Vec<u8> {
@@ -621,24 +792,68 @@ impl GsUsbDriver {
     }
 
     async fn send_frame(&mut self, frame: &CanFrame) -> io::Result<()> {
-        let buffer = self.encode_frame_auto(frame);
+        let fd_supported = (self.features & GS_CAN_FEATURE_FD) != 0;
 
-        loop {
-            match self.cmd_bulk_write(self.out_ep, buffer.clone()).await {
-                Ok(written) if written == buffer.len() => {
-                    return Ok(());
-                }
-                Ok(_) => {
-                    return Err(io::Error::new(
+        // Encode primary attempt
+        let mut buf = if fd_supported {
+            self.encode_frame_tx_76(frame) // 76 bytes for CAN-FD
+        } else {
+            self.encode_frame_minimal(frame) // 20 bytes for classic CAN
+        };
+
+        buf = self.maybe_pad_tx(buf);
+        debug!(
+            "TX len={} (wMaxPacketSize={}, pad_pkts={})",
+            buf.len(),
+            self.out_wmax,
+            self.pad_pkts.load(Ordering::Relaxed),
+        );
+
+        self.try_tx(frame, buf).await
+    }
+
+    async fn try_tx(&self, frame: &CanFrame, buf: Vec<u8>) -> io::Result<()> {
+        match self.cmd_bulk_write(self.out_ep, buf.clone()).await {
+            Ok(written) if written == buf.len() => Ok(()),
+
+            // PAD_PKTS was enabled but device rejected it → disable and retry unpadded
+            Err(e)
+                if e.kind() == io::ErrorKind::BrokenPipe
+                    && self.pad_pkts.load(Ordering::Relaxed) =>
+            {
+                log::warn!("TX stalled with PAD_PKTS enabled, disabling and retrying unpadded");
+                self.pad_pkts.store(false, Ordering::Relaxed);
+
+                // Re-encode frame without padding
+                let fallback = if (self.features & GS_CAN_FEATURE_FD) != 0 {
+                    self.encode_frame_tx_76(frame)
+                } else {
+                    self.encode_frame_minimal(frame)
+                };
+
+                // no padding this time
+                debug!(
+                    "TX fallback len={} (wMaxPacketSize={}, pad_pkts={})",
+                    fallback.len(),
+                    self.out_wmax,
+                    self.pad_pkts.load(Ordering::Relaxed),
+                );
+
+                match self.cmd_bulk_write(self.out_ep, fallback.clone()).await {
+                    Ok(written) if written == fallback.len() => Ok(()),
+                    Ok(_) => Err(io::Error::new(
                         io::ErrorKind::Other,
-                        "incomplete bulk write",
-                    ));
+                        "incomplete bulk write (fallback)",
+                    )),
+                    Err(e) => Err(e),
                 }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    sleep(USB_WRITE_RETRY_DELAY).await;
-                }
-                Err(err) => return Err(err),
             }
+
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "incomplete bulk write",
+            )),
+            Err(e) => Err(e),
         }
     }
 
@@ -657,19 +872,36 @@ impl GsUsbDriver {
         if self.timestamp_enabled {
             flags |= GS_CAN_MODE_HW_TIMESTAMP;
         }
-        if self.pad_pkts {
+        if self.pad_pkts.load(Ordering::Relaxed) {
             flags |= GS_CAN_MODE_PAD_PKTS_TO_MAX_PKT_SIZE;
         }
 
+        debug!(
+            "Opening channel {}, iface={}, flags={:#010x}",
+            self.channel_index, self.interface, flags
+        );
+
+        // Ensure we're cleanly in RESET before START (mirrors Linux gs_usb)
         self.cmd_control_out(
             request_type_out(),
             GS_USB_BREQ_MODE,
-            self.channel_index as u16, // value = channel
-            self.interface as u16,     // index = interface
+            self.channel_index as u16,
+            self.interface as u16,
+            encode_mode(GS_CAN_MODE_RESET, 0).to_vec(),
+        )
+        .await?;
+
+        // START with final flags
+        self.cmd_control_out(
+            request_type_out(),
+            GS_USB_BREQ_MODE,
+            self.channel_index as u16,
+            self.interface as u16,
             encode_mode(GS_CAN_MODE_START, flags).to_vec(),
         )
-        .await
-        .map(|_| ())
+        .await?;
+
+        Ok(())
     }
 
     async fn close_channel_inner(&mut self) -> io::Result<()> {
@@ -707,12 +939,19 @@ impl CanDriver for GsUsbDriver {
     }
 
     async fn set_bitrate(&mut self, bitrate: u32) -> io::Result<()> {
-        let timing = calc_bit_timing(bitrate).ok_or_else(|| {
+        let bt = self
+            .bt_const
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "BT_CONST not initialized"))?;
+
+        let timing = calc_bit_timing(bitrate, bt).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("Unable to compute bit timing for bitrate {bitrate}"),
             )
         })?;
+
+        debug!("Setting bitrate={} bps, timing={:?}", bitrate, timing);
 
         self.cmd_control_out(
             // MODE = RESET first
@@ -743,9 +982,14 @@ impl CanDriver for GsUsbDriver {
     }
 
     async fn open_channel(&mut self) -> io::Result<()> {
-        self.open_channel_inner().await
+        if self.configured_bitrate.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "set_bitrate() must be called before open_channel()",
+            ));
+        }
+        self.open_channel_inner().await // false = not listen-only
     }
-
     async fn send_frame(&mut self, frame: &CanFrame) -> io::Result<()> {
         self.send_frame(frame).await
     }

@@ -11,6 +11,37 @@ pub(crate) struct GsDeviceBitTiming {
     pub(crate) brp: u32,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GsBtConst {
+    pub feature: u32, // LE
+    fclk_can: u32,    // Hz
+    tseg1_min: u32,
+    tseg1_max: u32,
+    tseg2_min: u32,
+    tseg2_max: u32,
+    sjw_max: u32,
+    brp_min: u32,
+    brp_max: u32,
+    brp_inc: u32,
+}
+
+pub fn parse_bt_const(b: &[u8]) -> GsBtConst {
+    let le32 = |i| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+    GsBtConst {
+        feature: le32(0),
+        fclk_can: le32(4),
+        tseg1_min: le32(8),
+        tseg1_max: le32(12),
+        tseg2_min: le32(16),
+        tseg2_max: le32(20),
+        sjw_max: le32(24),
+        brp_min: le32(28),
+        brp_max: le32(32),
+        brp_inc: le32(36),
+    }
+}
+
 impl GsDeviceBitTiming {
     pub(crate) fn to_bytes(self) -> [u8; 20] {
         let mut buf = [0u8; 20];
@@ -30,23 +61,37 @@ pub(crate) fn encode_mode(mode: u32, flags: u32) -> [u8; 8] {
     buf
 }
 
-pub(crate) fn calc_bit_timing(bitrate: u32) -> Option<GsDeviceBitTiming> {
-    const FCLK: u32 = 48_000_000;
-    const TSEG1_MIN: u32 = 1;
-    const TSEG1_MAX: u32 = 16;
-    const TSEG2_MIN: u32 = 1;
-    const TSEG2_MAX: u32 = 8;
-    const SJW_MAX: u32 = 4;
-    const BRP_MIN: u32 = 1;
-    const BRP_MAX: u32 = 1024;
+pub(crate) fn calc_bit_timing(bitrate: u32, caps: &GsBtConst) -> Option<GsDeviceBitTiming> {
+    let fclk = caps.fclk_can;
+    let tseg1_min = caps.tseg1_min;
+    let tseg1_max = caps.tseg1_max;
+    let tseg2_min = caps.tseg2_min;
+    let tseg2_max = caps.tseg2_max;
+    let sjw_max = caps.sjw_max;
+    let brp_min = caps.brp_min;
+    let brp_max = caps.brp_max;
+    let brp_inc = caps.brp_inc.max(1); // safety
+
+    log::info!(
+        "BT_CONST: fclk_can={}Hz tseg1=[{}..{}] tseg2=[{}..{}] sjw_max={} brp=[{}..{}] inc={}",
+        fclk,
+        tseg1_min,
+        tseg1_max,
+        tseg2_min,
+        tseg2_max,
+        sjw_max,
+        brp_min,
+        brp_max,
+        brp_inc
+    );
 
     let mut best: Option<(GsDeviceBitTiming, f64)> = None;
 
-    for brp in BRP_MIN..=BRP_MAX {
-        for tseg1 in TSEG1_MIN..=TSEG1_MAX {
-            for tseg2 in TSEG2_MIN..=TSEG2_MAX {
+    for brp in brp_min..=brp_max {
+        for tseg1 in tseg1_min..=tseg1_max {
+            for tseg2 in tseg2_min..=tseg2_max {
                 let total_tq = 1 + tseg1 + tseg2;
-                let actual_bitrate = FCLK as f64 / (brp as f64 * total_tq as f64);
+                let actual_bitrate = fclk as f64 / (brp as f64 * total_tq as f64);
                 let rate_error = (actual_bitrate - bitrate as f64).abs() / bitrate as f64;
                 if rate_error > 0.05 {
                     continue;
@@ -57,7 +102,7 @@ pub(crate) fn calc_bit_timing(bitrate: u32) -> Option<GsDeviceBitTiming> {
                 let score = rate_error * 10.0 + sample_error;
 
                 let mut phase_seg1 = if tseg1 > 1 {
-                    min(tseg1 / 2, TSEG1_MAX)
+                    min(tseg1 / 2, tseg1_max)
                 } else {
                     1
                 };
@@ -74,7 +119,7 @@ pub(crate) fn calc_bit_timing(bitrate: u32) -> Option<GsDeviceBitTiming> {
                     }
                 }
                 let phase_seg2 = tseg2;
-                let sjw = min(SJW_MAX, phase_seg2);
+                let sjw = min(sjw_max, phase_seg2);
 
                 let candidate = GsDeviceBitTiming {
                     prop_seg,
