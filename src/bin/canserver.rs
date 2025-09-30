@@ -1,6 +1,8 @@
 use bincode;
 use clap::Parser;
 use crosscan::can::CanFrame;
+use serialport::available_ports;
+use std::path::Path;
 use std::process::exit;
 use std::sync::Arc;
 use tokio::signal;
@@ -9,10 +11,28 @@ use tokio::sync::mpsc;
 use tokio::time::Duration;
 use win_can_utils::{CanDriver, GsUsbDriver, PcanDriver, SlcanDriver, thread_manager_async};
 
+fn next_auto_channel(base: &str) -> String {
+    let mut idx = 0;
+    loop {
+        let candidate = format!("{}{}", base, idx);
+        let path = &format!(r"\\.\pipe\can_{}_in", candidate);
+
+        let pipe_path = Path::new(path);
+
+        if !pipe_path.exists() {
+            return candidate;
+        }
+
+        idx += 1;
+    }
+}
+
 #[derive(Parser, Debug)]
 struct Cli {
-    #[arg(short = 'd', long = "driver", default_value = "slcan")]
+    /// Supported drivers: gsusb, pcan, slcan
     driver: String,
+    /// Channel: use auto for auto-detect
+    #[arg(short = 'c', long = "channel", default_value = "auto")]
     channel: String,
     #[arg(short = 'b', long = "bitrate")]
     bitrate: Option<u32>,
@@ -86,16 +106,59 @@ async fn init_pcan(cli: &Cli) -> std::io::Result<Box<dyn CanDriver>> {
 }
 
 async fn init_slcan(cli: &Cli) -> std::io::Result<Box<dyn CanDriver>> {
-    let mut slcan_driver = match SlcanDriver::open(&cli.channel).await {
-        Ok(d) => d,
-        Err(_) => {
+    let mut slcan_driver = if cli.channel.to_ascii_lowercase() == "auto" {
+        // Enumerate all serial ports on the system
+        let ports = available_ports().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to list serial ports: {}", e),
+            )
+        })?;
+
+        if ports.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!(
-                    "Could not open serial port {}. Is it an slcan device?",
-                    &cli.channel
-                ),
+                "No serial ports found on this system.",
             ));
+        }
+
+        let mut found: Option<SlcanDriver> = None;
+        for p in ports {
+            let port_name = p.port_name;
+            println!("Trying SLCAN auto-detect on {}", port_name);
+
+            if let Ok(mut driver) = SlcanDriver::open(&port_name).await {
+                if driver.get_version().await.is_err() {
+                    continue;
+                }
+                println!("Auto-detected SLCAN device on {}", port_name);
+                found = Some(driver);
+                break;
+            }
+        }
+
+        match found {
+            Some(d) => d,
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Could not auto-detect an SLCAN device (checked all available COM/tty ports).",
+                ));
+            }
+        }
+    } else {
+        // User provided a channel manually
+        match SlcanDriver::open(&cli.channel).await {
+            Ok(d) => d,
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "Could not open serial port {}. Is it an slcan device?",
+                        &cli.channel
+                    ),
+                ));
+            }
         }
     };
 
@@ -138,10 +201,7 @@ async fn init_slcan(cli: &Cli) -> std::io::Result<Box<dyn CanDriver>> {
         }
     };
 
-    println!(
-        "SLCan Connected on {}. FW Version: {}",
-        &cli.channel, firmware_version
-    );
+    println!("SLCan Connected. FW Version: {}", firmware_version);
 
     slcan_driver.set_bitrate(bitrate).await?;
     slcan_driver.enable_timestamp().await?;
@@ -176,6 +236,12 @@ async fn main() -> std::io::Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 
+    let channel_name = if cli.channel.to_ascii_lowercase() == "auto" {
+        next_auto_channel("auto")
+    } else {
+        cli.channel.clone()
+    };
+
     // Initialize the specified driver.
     let driver = match cli.driver.to_lowercase().as_str() {
         "slcan" => init_slcan(&cli).await,
@@ -203,14 +269,16 @@ async fn main() -> std::io::Result<()> {
     let (tx_in_pipe, mut rx_in_pipe) = mpsc::channel::<Vec<u8>>(100);
 
     tokio::spawn(thread_manager_async::start_ipc_reader(
-        cli.channel.clone(),
+        channel_name.clone(),
         tx_in_pipe,
     ));
 
     tokio::spawn(thread_manager_async::start_ipc_writer(
-        cli.channel.clone(),
+        channel_name.clone(),
         rx_out_pipe,
     ));
+
+    println!("\nCreated CAN server: {}", channel_name);
 
     let driver_in = driver.clone();
     let driver_out = driver.clone();

@@ -5,6 +5,7 @@ use memchr::memchr;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, split};
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 use tokio_serial::SerialStream;
 
 use crate::can_driver::CanDriver;
@@ -185,17 +186,37 @@ impl SlcanDriver {
         let mut reader = BufReader::new(&mut *reader);
         let mut buf = Vec::new();
 
-        loop {
-            reader.read_until(b'\r', &mut buf).await?;
+        // Wait for response with a timeout
+        let res = timeout(Duration::from_millis(20), async {
+            loop {
+                buf.clear();
+                let n = reader.read_until(b'\r', &mut buf).await?;
 
-            if buf[0] != b'T' {
-                break;
+                if n == 0 {
+                    // EOF
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "Device closed connection",
+                    ));
+                }
+
+                // Skip "T" lines (CAN frames)
+                if buf.get(0) == Some(&b'T') {
+                    continue;
+                }
+
+                return Ok(String::from_utf8_lossy(&buf).trim().to_string());
             }
+        })
+        .await;
 
-            buf = Vec::new();
+        match res {
+            Ok(inner) => inner,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Timeout waiting for SLCAN version response",
+            )),
         }
-
-        Ok(String::from_utf8_lossy(&buf).trim().to_string())
     }
 }
 

@@ -15,8 +15,6 @@ async fn create_server_and_wait(pipe_name: &str) -> std::io::Result<NamedPipeSer
     // until we await the connection below.
     let server = ServerOptions::new().create(pipe_name)?;
 
-    println!("Created server on: {:?}", pipe_name);
-
     // Wait until a client connects before returning the ready-to-use server.
     server.connect().await.map(|()| server)
 }
