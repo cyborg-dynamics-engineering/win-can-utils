@@ -22,7 +22,7 @@ use tokio::sync::oneshot;
 use super::constants::duration_to_timeout;
 
 #[derive(Copy, Clone)]
-struct LibusbCtxPtr(*mut libusb::libusb_context);
+pub(crate) struct LibusbCtxPtr(pub(crate) *mut libusb::libusb_context);
 
 unsafe impl Send for LibusbCtxPtr {}
 unsafe impl Sync for LibusbCtxPtr {}
@@ -230,6 +230,39 @@ impl LibusbDeviceHandle {
         }
     }
 
+    pub(crate) async fn control_in(
+        &self,
+        request_type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> io::Result<usize> {
+        let millis = duration_to_timeout(timeout) as u32;
+        // Safe: libusb takes mutable pointer + len
+        let res = unsafe {
+            libusb1_sys::libusb_control_transfer(
+                self.handle.0,
+                request_type,
+                request,
+                value,
+                index,
+                buf.as_mut_ptr(),
+                buf.len() as u16,
+                millis,
+            )
+        };
+        if res < 0 {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("libusb control_in error {}", res),
+            ))
+        } else {
+            Ok(res as usize)
+        }
+    }
+
     pub(crate) async fn bulk_read(
         &self,
         endpoint: u8,
@@ -371,6 +404,86 @@ impl LibusbDeviceHandle {
         }
         buffer.truncate(transferred as usize);
         Ok(buffer)
+    }
+
+    pub(crate) fn bulk_write_blocking(
+        &self,
+        endpoint: u8,
+        data: Vec<u8>,
+        timeout: Duration,
+    ) -> io::Result<usize> {
+        let mut transferred: c_int = 0;
+        let rc = unsafe {
+            libusb::libusb_bulk_transfer(
+                self.handle.0,
+                endpoint,
+                data.as_ptr() as *mut u8,
+                data.len() as c_int,
+                &mut transferred,
+                duration_to_timeout(timeout) as c_uint,
+            )
+        };
+        if rc < 0 {
+            eprintln!("[usb] bulk_write_blocking error: rc={rc}");
+            return Err(map_libusb_error(rc));
+        }
+        Ok(transferred as usize)
+    }
+
+    pub(crate) fn control_out_blocking(
+        &self,
+        request_type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        data: &[u8],
+        timeout: Duration,
+    ) -> io::Result<usize> {
+        let millis = duration_to_timeout(timeout) as u32;
+        let rc = unsafe {
+            libusb::libusb_control_transfer(
+                self.handle.0,
+                request_type,
+                request,
+                value,
+                index,
+                data.as_ptr() as *mut u8,
+                data.len() as u16,
+                millis,
+            )
+        };
+        if rc < 0 {
+            return Err(map_libusb_error(rc));
+        }
+        Ok(rc as usize)
+    }
+
+    pub(crate) fn control_in_blocking(
+        &self,
+        request_type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> io::Result<usize> {
+        let millis = duration_to_timeout(timeout) as u32;
+        let rc = unsafe {
+            libusb::libusb_control_transfer(
+                self.handle.0,
+                request_type,
+                request,
+                value,
+                index,
+                buf.as_mut_ptr(),
+                buf.len() as u16,
+                millis,
+            )
+        };
+        if rc < 0 {
+            return Err(map_libusb_error(rc));
+        }
+        Ok(rc as usize)
     }
 }
 

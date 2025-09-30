@@ -224,7 +224,6 @@ async fn main() -> std::io::Result<()> {
                 if let Err(e) = d.send_frame(&frame).await {
                     eprintln!("Failed to send CAN frame: {:?}", e);
                 }
-                println!("Sent");
             }
         }
         // channel closed → exit loop
