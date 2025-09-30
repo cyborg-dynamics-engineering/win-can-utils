@@ -237,7 +237,7 @@ async fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
 
     let channel_name = if cli.channel.to_ascii_lowercase() == "auto" {
-        next_auto_channel("auto")
+        next_auto_channel("can")
     } else {
         cli.channel.clone()
     };
