@@ -7,7 +7,7 @@ use tokio::signal;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
-use win_can_utils::{CanDriver, PcanDriver, SlcanDriver, thread_manager_async};
+use win_can_utils::{CanDriver, GsUsbDriver, PcanDriver, SlcanDriver, thread_manager_async};
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -150,6 +150,26 @@ async fn init_slcan(cli: &Cli) -> std::io::Result<Box<dyn CanDriver>> {
     Ok(Box::new(slcan_driver))
 }
 
+async fn init_gsusb(cli: &Cli) -> std::io::Result<Box<dyn CanDriver>> {
+    let mut driver = GsUsbDriver::open(&cli.channel).await?;
+
+    driver.close_channel().await?;
+
+    let bitrate = cli.bitrate.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "No bitrate provided. Specify one with -b <bitrate> for gs_usb devices.",
+        )
+    })?;
+
+    println!("gs_usb connected to {}", driver.device_label());
+
+    driver.set_bitrate(bitrate).await?;
+    driver.open_channel().await?;
+
+    Ok(Box::new(driver))
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
@@ -158,9 +178,10 @@ async fn main() -> std::io::Result<()> {
     let driver = match cli.driver.to_lowercase().as_str() {
         "slcan" => init_slcan(&cli).await,
         "pcan" => init_pcan(&cli).await,
+        "gsusb" | "gs_usb" => init_gsusb(&cli).await,
         _ => {
             eprintln!(
-                "Did not recognize driver specified: {}\nSupported drivers are: slcan",
+                "Did not recognize driver specified: {}\nSupported drivers are: slcan, pcan, gsusb",
                 cli.driver
             );
             exit(1);
@@ -213,6 +234,7 @@ async fn main() -> std::io::Result<()> {
         loop {
             match driver_out.lock().await.read_frames().await {
                 Ok(frames) => {
+                    // println!("{:?}", frames);
                     for frame in frames {
                         if let Ok(mut data) =
                             bincode::serde::encode_to_vec(frame, bincode::config::standard())
