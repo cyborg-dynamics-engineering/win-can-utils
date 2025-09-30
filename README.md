@@ -10,7 +10,7 @@ This project aims to provide a Windows equivalent of [can-utils](https://github.
     - [CAN Server](#can-server)
     - [CAN Dump](#can-dump)
     - [CAN Send](#can-send)
-  - [slcan firmware installation](#slcan-firmware-installation)
+  - [canable firmware installation](#canable-firmware-installation)
   - [License](#license)
   - [Developers](#developers)
     - [Contribution](#contribution)
@@ -57,18 +57,18 @@ update the DLL in the future.
 
 ## Usage
 ### CAN Server
-Opens a serial line CAN connection to an slcan adapter and exposes it via Windows [pipe](https://learn.microsoft.com/en-us/windows/win32/ipc/pipes).<br>
-To find the adapter, open 'Device Manager' and look in the 'Ports (COM & LPT)' dropdown.
+Opens a CAN connection to a USB-to-CAN adapter and exposes it via Windows [pipe](https://learn.microsoft.com/en-us/windows/win32/ipc/pipes).<br>
+The exact interface can be auto-detected, or specified through the --channel flag. Bitrate usually **must** be specified unless auto-detect is supported by the adapter.
 ```
-Usage: canserver <driver> <port> [--bitrate <bitrate>]
-Example: canserver slcan COM5 --bitrate 1000000
+Usage: canserver <driver> [--channel <channel> --bitrate <bitrate>]
+Example: canserver slcan --bitrate 1000000
+```
 
 Supported drivers:
 
-- `slcan` for serial-line CAN adapters.
-- `pcan` for Peak PCAN-USB/PCI/LAN adapters.
 - `gsusb` for CANable/candleLight style USB adapters using the gs_usb protocol.
-```
+- `slcan` for serial-line CAN adapters.
+- `pcan` for Peak PCAN-USB/PCI/LAN adapters. **See [PCAN-Basic dependency](#pcan-basic-dependency)**
 
 ### CAN Dump
 Prints realtime CAN data from an open CAN pipe to standard output.
@@ -86,10 +86,8 @@ Example: cansend COM5 055#00
 ```
 NOTE: A CAN server instance **must** be open for the target port.
 
-## slcan firmware installation
-SH-C30A and SH-C31A may not ship with slcan firmware. The stock CANable slcan firmware can be installed using the online canable updater tool: https://canable.io/updater/.
-* SH-C30A requires CANable v1.0 'slcan' firmware: https://canable.io/updater/canable1.html.
-* SH-C31A requires CANable v2.0 'slcan with FD support' firmware: https://canable.io/updater/canable2.html
+## canable firmware installation
+canable devices may not ship with the desired firmware. The stock CANable firmware can be installed using the online canable updater tool: https://canable.io/updater/. Candlelight is **preferred** as it supports higher data throughput than slcan. 
 
 To flash the device, perform the following steps:
 1. Unplug the adapter from your computer.
@@ -97,13 +95,13 @@ To flash the device, perform the following steps:
    
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<img src="https://github.com/user-attachments/assets/154c4837-61d0-402f-9a38-76f50d5a5f81" width="200">
 
-4. Plug the adapter into your computer.
-5. Open the canable updater page and select 'Connect and Update'.
-6. Choose the CAN adapter from the list. It should appear as 'DFU in FS Mode - Paired'.
-7. Wait for the flash to complete. An error message may appear, but can be ignored.
-8. Put the boot switch into the 'Off' position.
-9. Unplug and re-insert the adapter into the PC.
-10. Attempt to open a can_server using the device to determine whether flashing was successful.
+3. Plug the adapter into your computer.
+4. Open the canable updater page and select 'Connect and Update'.
+5. Choose the CAN adapter from the list. It should appear as 'DFU in FS Mode - Paired'.
+6. Wait for the flash to complete. An error message may appear, but can be ignored.
+7. Put the boot switch into the 'Off' position.
+8. Unplug and re-insert the adapter into the PC.
+9. Attempt to open a can_server using the device to determine whether flashing was successful.
 
 ## License
 Windows CAN Utils is licensed under either of Apache License, Version 2.0 (LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0) or MIT license (LICENSE-MIT or http://opensource.org/licenses/MIT) at your option.
