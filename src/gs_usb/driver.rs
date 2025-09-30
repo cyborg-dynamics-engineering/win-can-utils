@@ -7,7 +7,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use crosscan::can::CanFrame;
 use tokio::sync::{mpsc, oneshot};
-
 use crate::can_driver::CanDriver;
 use crate::gs_usb::bit_timing::{GsBtConst, parse_bt_const};
 use crate::gs_usb::context::map_libusb_error;
@@ -19,7 +18,6 @@ use super::device::select_device;
 use super::frames::parse_host_frame_at;
 
 use log::{debug, error, info, warn};
-
 /// State owned by the dedicated USB thread.
 ///
 /// The gs_usb protocol requires that all libusb operations are serialized from a
@@ -181,8 +179,6 @@ impl UsbEventLoop {
             return Ok(());
         }
 
-        // debug!("RX chunk ({} bytes): {:02x?}", chunk.len(), chunk);
-
         self.rx_buffer.extend_from_slice(chunk);
 
         let mut offset = 0usize;
@@ -197,12 +193,6 @@ impl UsbEventLoop {
                 None => break,
                 Some((maybe_frame, consumed)) => {
                     if let Some(frame) = maybe_frame {
-                        // debug!(
-                        //     " → Parsed frame: id={:08x}, dlc={}, data={:02x?}",
-                        //     frame.id(),
-                        //     frame.dlc(),
-                        //     frame.data()
-                        // );
                         let _ = self.frame_tx.send(frame).await;
                     }
                     offset += consumed;
