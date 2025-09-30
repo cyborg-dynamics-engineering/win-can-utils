@@ -4,12 +4,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use async_trait::async_trait;
-use crosscan::can::CanFrame;
-use tokio::sync::{mpsc, oneshot};
 use crate::can_driver::CanDriver;
 use crate::gs_usb::bit_timing::{GsBtConst, parse_bt_const};
 use crate::gs_usb::context::map_libusb_error;
+use async_trait::async_trait;
+use crosscan::can::CanFrame;
+use tokio::sync::{mpsc, oneshot};
 
 use super::bit_timing::{calc_bit_timing, encode_mode};
 use super::constants::*;

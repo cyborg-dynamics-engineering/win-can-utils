@@ -3,18 +3,22 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::mpsc::{Receiver, Sender};
 
-/// Blocking helper: create PipeServer and wait for client connection
+/// Blocking helper: create a [`NamedPipeServer`] and wait for a client
+/// connection.
+///
+/// The `tokio` named pipe API returns immediately after creation, so we need
+/// to explicitly wait for an inbound connection before handing the pipe to the
+/// caller.  Keeping this logic in a helper keeps the reader and writer
+/// routines focused on their respective loops.
 async fn create_server_and_wait(pipe_name: &str) -> std::io::Result<NamedPipeServer> {
-    // Create server (this does NOT block)
+    // Creating the server does not block; this simply reserves the pipe name
+    // until we await the connection below.
     let server = ServerOptions::new().create(pipe_name)?;
 
     println!("Created server on: {:?}", pipe_name);
 
-    // Wait until a client connects
-    match server.connect().await {
-        Ok(()) => Ok(server),
-        Err(e) => Err(e),
-    }
+    // Wait until a client connects before returning the ready-to-use server.
+    server.connect().await.map(|()| server)
 }
 
 /// Start the IPC reader, creating and waiting for pipe server connection without blocking async runtime
@@ -24,18 +28,16 @@ pub async fn start_ipc_reader(channel_name: String, tx: Sender<Vec<u8>>) -> std:
     loop {
         let server = create_server_and_wait(&pipe_name).await?;
 
-        let tx_clone = tx.clone();
-
         let mut reader = BufReader::new(server);
         loop {
             let mut line: Vec<u8> = vec![];
-            reader.read_buf(&mut line).await?;
+            let bytes_read = reader.read_buf(&mut line).await?;
 
-            if line.len() == 0 {
+            if bytes_read == 0 {
                 println!("Pipe closed by client");
                 break;
             }
-            if tx_clone.send(line).await.is_err() {
+            if tx.send(line).await.is_err() {
                 println!("Receiver closed");
                 break;
             }
@@ -47,7 +49,7 @@ pub async fn start_ipc_writer(
     channel_name: String,
     mut rx: Receiver<Vec<u8>>,
 ) -> std::io::Result<()> {
-    let pipe_name = format!(r"\\.\pipe\can_{}_out", channel_name.clone());
+    let pipe_name = format!(r"\\.\pipe\can_{}_out", channel_name);
     let mut server = create_server_and_wait(&pipe_name).await?;
 
     loop {
@@ -65,10 +67,9 @@ pub async fn start_ipc_writer(
                     }
                 }
 
-                match server.flush().await {
-                    Ok(()) => (),
-                    Err(e) => return Err(e),
-                }
+                // Explicitly flush to ensure the client sees the full frame
+                // before we await the next message from the channel.
+                server.flush().await?;
             }
             None => {
                 // Channel closed: exit cleanly
