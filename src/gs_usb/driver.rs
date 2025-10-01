@@ -547,7 +547,7 @@ impl GsUsbDriver {
             })
             .await
             .map_err(|_| {
-                error!("ControlIn → USB event loop closed before send");
+                warn!("ControlIn → USB event loop closed before send");
                 io::Error::new(io::ErrorKind::Other, "USB event loop closed")
             })?;
 
@@ -557,11 +557,11 @@ impl GsUsbDriver {
                 Ok(buf)
             }
             Ok(Err(e)) => {
-                error!("ControlIn ← error: {}", e);
+                warn!("ControlIn ← error: {}", e);
                 Err(e)
             }
             Err(_) => {
-                error!("ControlIn ← USB event loop dropped before response");
+                warn!("ControlIn ← USB event loop dropped before response");
                 Err(io::Error::new(
                     io::ErrorKind::Other,
                     "USB event loop dropped",

@@ -101,7 +101,7 @@ impl SlcanDriver {
 
         let timestamp = if has_timestamp && line.len() >= ts_start + 8 {
             parse_hex_u32(&line[ts_start..ts_start + 8])
-                .map(|low| ((u64::from(*timestamp_high) << 32) | u64::from(low)))
+                .map(|low| (u64::from(*timestamp_high) << 32) | u64::from(low))
         } else {
             None
         };
