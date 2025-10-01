@@ -1,6 +1,10 @@
+
+
 # Windows CAN Utils
 
 This project aims to provide a Windows equivalent of [can-utils](https://github.com/linux-can/can-utils), offering CLI tools for interacting with CAN devices via USB-to-CAN transceivers. It currently supports canable adapters and pcan adapters. The canable adapter best supported are the DSD Tech [SH-C30A](https://www.deshide.com/product-details_SH-C30A.html) and [SH-C31A](https://www.deshide.com/product-details_SH-C31A.html), both of which are widely available on Amazon for under $20 USD.
+
+**⚠️ NOTE: If you're interested in this project, there's a good chance you'll find our [CyderVis](https://github.com/cyborg-dynamics-engineering/cyder-vis) project useful too!**
 
 ## Table of Contents
 - [Windows CAN Utils](#windows-can-utils)
@@ -77,7 +81,7 @@ Prints realtime CAN data from an open CAN pipe to standard output.
 Usage: candump <port>
 Example: candump COM5
 ```
-NOTE: A CAN server instance **must** be open for the target port.
+⚠️ NOTE: A CAN server instance **must** be open for the target port.
 
 ### CAN Send
 Sends the given CAN frame to an open CAN pipe.
@@ -85,7 +89,7 @@ Sends the given CAN frame to an open CAN pipe.
 Usage: cansend <port> <ID#DATA>
 Example: cansend COM5 055#00
 ```
-NOTE: A CAN server instance **must** be open for the target port.
+⚠️ NOTE: A CAN server instance **must** be open for the target port.
 
 ## canable firmware installation
 canable devices may not ship with the desired firmware. The stock CANable firmware can be installed using the online canable updater tool: https://canable.io/updater/. Candlelight is **preferred** as it supports higher data throughput than slcan. 
