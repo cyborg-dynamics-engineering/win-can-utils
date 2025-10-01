@@ -36,7 +36,7 @@ pub(crate) fn plausible_header(hdr: &[u8], expected_chan: u8) -> bool {
 pub(crate) fn parse_host_frame_at(
     bytes: &[u8],
     channel_index: u8,
-    _timestamp_enabled: bool,
+    timestamp_enabled: bool,
     _last_ts64: &mut Option<u64>,
 ) -> Option<(Option<CanFrame>, usize)> {
     if bytes.len() < GS_HEADER_LEN {
@@ -44,6 +44,7 @@ pub(crate) fn parse_host_frame_at(
     }
 
     if !plausible_header(bytes, channel_index) {
+        // resync by 1 byte (same as your working version)
         return Some((None, 1));
     }
 
@@ -53,7 +54,31 @@ pub(crate) fn parse_host_frame_at(
     let chan = bytes[9];
     let data_len = dlc_to_len(dlc);
 
-    let total_len = GS_HEADER_LEN + data_len;
+    // Base: header + payload (no alignment by default, like your “good” version)
+    let mut total_len = GS_HEADER_LEN + data_len;
+
+    // --- DLC=0 padding quirks ---
+    // Some fw pads zero-length data to 20 bytes even when timestamps are OFF:
+    //   12-byte header + 8 bytes of zeros.
+    // With timestamps ON, older fw does:
+    //   12-byte header + 8 pad + 4-byte ts = 24 bytes.
+    if data_len == 0 {
+        if timestamp_enabled {
+            // If ts is ON and we have enough bytes, consume the padded+ts frame as 24
+            if bytes.len() >= 24 {
+                total_len = 24;
+            } else {
+                return None; // wait for full 24 bytes
+            }
+        } else {
+            // If ts is OFF, prefer the padded 20 if it looks like padding
+            if bytes.len() >= 20 && bytes[12..20].iter().all(|&b| b == 0) {
+                total_len = 20;
+            }
+            // else leave total_len as 12 (un-padded case)
+        }
+    }
+
     if total_len > GS_MAX_FRAME_LEN {
         return Some((None, 1));
     }
@@ -61,12 +86,14 @@ pub(crate) fn parse_host_frame_at(
         return None;
     }
 
-    let data_off = GS_HEADER_LEN;
-    let data = &bytes[data_off..data_off + data_len];
-
+    // Echo or wrong channel → skip this whole frame
     if echo_id != GS_CAN_ECHO_ID_UNUSED || chan != channel_index {
         return Some((None, total_len));
     }
+
+    // Build CAN frame
+    let data_off = GS_HEADER_LEN;
+    let data = &bytes[data_off..data_off + data_len];
 
     let frame = if (raw_id & CAN_ERR_FLAG) != 0 {
         CanFrame::new_error(raw_id & CAN_ERR_MASK).ok()?
