@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tokio_serial::SerialStream;
 
-use crate::can_driver::CanDriver;
+use crate::drivers::CanDriver;
 
 pub struct SlcanDriver {
     reader: Mutex<tokio::io::ReadHalf<SerialStream>>,

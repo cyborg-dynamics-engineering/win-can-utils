@@ -11,6 +11,11 @@ use tokio::sync::mpsc;
 use tokio::time::Duration;
 use win_can_utils::{CanDriver, GsUsbDriver, PcanDriver, SlcanDriver, thread_manager_async};
 
+/// Determine the next available IPC channel name by probing for an unused pipe.
+///
+/// The IPC implementation uses Windows named pipes whose names are derived from the
+/// channel.  We iterate a numeric suffix until we find a pipe that does not exist
+/// yet and return the corresponding channel identifier.
 fn next_auto_channel(base: &str) -> String {
     let mut idx = 0;
     loop {
@@ -231,6 +236,92 @@ async fn init_gsusb(cli: &Cli) -> std::io::Result<Box<dyn CanDriver>> {
     Ok(Box::new(driver))
 }
 
+/// Resolve the requested driver implementation from the CLI arguments.
+async fn initialize_driver(cli: &Cli) -> std::io::Result<Box<dyn CanDriver>> {
+    match cli.driver.to_lowercase().as_str() {
+        "slcan" => init_slcan(cli).await,
+        "pcan" => init_pcan(cli).await,
+        "gsusb" | "gs_usb" => init_gsusb(cli).await,
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "Did not recognize driver specified: {}\nSupported drivers are: slcan, pcan, gsusb",
+                other
+            ),
+        )),
+    }
+}
+
+/// Spawn background tasks responsible for reading and writing the IPC pipes.
+///
+/// The caller receives the sender towards the writer and the receiver from the
+/// reader so it can bridge the IPC traffic with the CAN driver.
+fn spawn_ipc_tasks(channel_name: String) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+    let (tx_out_pipe, rx_out_pipe) = mpsc::channel::<Vec<u8>>(100);
+    let (tx_in_pipe, rx_in_pipe) = mpsc::channel::<Vec<u8>>(100);
+
+    tokio::spawn(thread_manager_async::start_ipc_reader(
+        channel_name.clone(),
+        tx_in_pipe,
+    ));
+
+    tokio::spawn(thread_manager_async::start_ipc_writer(
+        channel_name,
+        rx_out_pipe,
+    ));
+
+    (tx_out_pipe, rx_in_pipe)
+}
+
+/// Consume CAN frames received from the IPC pipe and forward them to the driver.
+async fn forward_pipe_to_can(
+    mut rx_in_pipe: mpsc::Receiver<Vec<u8>>,
+    driver: Arc<Mutex<Box<dyn CanDriver>>>,
+) {
+    while let Some(line) = rx_in_pipe.recv().await {
+        if let Ok((frame, _)) =
+            bincode::serde::decode_from_slice::<CanFrame, _>(&line, bincode::config::standard())
+        {
+            let mut d = driver.lock().await;
+            if let Err(e) = d.send_frame(&frame).await {
+                eprintln!("Failed to send CAN frame: {:?}", e);
+            }
+        }
+    }
+}
+
+/// Continuously poll the CAN driver and push any frames to the IPC writer.
+async fn forward_can_to_pipe(
+    driver: Arc<Mutex<Box<dyn CanDriver>>>,
+    tx_out_pipe: mpsc::Sender<Vec<u8>>,
+) {
+    loop {
+        match driver.lock().await.read_frames().await {
+            Ok(frames) => {
+                for frame in frames {
+                    if let Ok(mut data) =
+                        bincode::serde::encode_to_vec(frame, bincode::config::standard())
+                    {
+                        if data.len() > (u8::MAX as usize) {
+                            eprintln!("Serialized CanFrame too large: {}", data.len());
+                            continue;
+                        }
+                        let mut msg = vec![data.len() as u8];
+                        msg.append(&mut data);
+                        if let Err(err) = tx_out_pipe.try_send(msg) {
+                            eprintln!("Failed to queue frame for IPC writer: {:?}", err);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to read frames from CAN driver: {:?}", e);
+                break;
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init();
@@ -242,22 +333,8 @@ async fn main() -> std::io::Result<()> {
         cli.channel.clone()
     };
 
-    // Initialize the specified driver.
-    let driver = match cli.driver.to_lowercase().as_str() {
-        "slcan" => init_slcan(&cli).await,
-        "pcan" => init_pcan(&cli).await,
-        "gsusb" | "gs_usb" => init_gsusb(&cli).await,
-        _ => {
-            eprintln!(
-                "Did not recognize driver specified: {}\nSupported drivers are: slcan, pcan, gsusb",
-                cli.driver
-            );
-            exit(1);
-        }
-    };
-
-    // Check driver start errors.
-    let driver = match driver {
+    // Initialize the requested CAN driver implementation.
+    let driver = match initialize_driver(&cli).await {
         Ok(driver) => Arc::new(Mutex::new(driver)),
         Err(e) => {
             eprintln!("{}", e.to_string());
@@ -265,66 +342,15 @@ async fn main() -> std::io::Result<()> {
         }
     };
 
-    let (tx_out_pipe, rx_out_pipe) = mpsc::channel::<Vec<u8>>(100);
-    let (tx_in_pipe, mut rx_in_pipe) = mpsc::channel::<Vec<u8>>(100);
-
-    tokio::spawn(thread_manager_async::start_ipc_reader(
-        channel_name.clone(),
-        tx_in_pipe,
-    ));
-
-    tokio::spawn(thread_manager_async::start_ipc_writer(
-        channel_name.clone(),
-        rx_out_pipe,
-    ));
+    let (tx_out_pipe, rx_in_pipe) = spawn_ipc_tasks(channel_name.clone());
 
     println!("\nCreated CAN server: {}", channel_name);
 
-    let driver_in = driver.clone();
-    let driver_out = driver.clone();
+    // Task to bridge IPC traffic into the CAN driver.
+    let mut task_in = tokio::spawn(forward_pipe_to_can(rx_in_pipe, driver.clone()));
 
-    // Task to handle incoming pipe → CAN
-    let mut task_in = tokio::spawn(async move {
-        while let Some(line) = rx_in_pipe.recv().await {
-            if let Ok((frame, _)) =
-                bincode::serde::decode_from_slice::<CanFrame, _>(&line, bincode::config::standard())
-            {
-                let mut d = driver_in.lock().await;
-                if let Err(e) = d.send_frame(&frame).await {
-                    eprintln!("Failed to send CAN frame: {:?}", e);
-                }
-            }
-        }
-        // channel closed → exit loop
-    });
-
-    // Task to handle CAN → outgoing pipe
-    let mut task_out = tokio::spawn(async move {
-        loop {
-            match driver_out.lock().await.read_frames().await {
-                Ok(frames) => {
-                    // println!("{:?}", frames);
-                    for frame in frames {
-                        if let Ok(mut data) =
-                            bincode::serde::encode_to_vec(frame, bincode::config::standard())
-                        {
-                            if data.len() > (u8::MAX as usize) {
-                                eprintln!("Serialized CanFrame too large: {}", data.len());
-                                continue;
-                            }
-                            let mut msg = vec![data.len() as u8];
-                            msg.append(&mut data);
-                            let _ = tx_out_pipe.try_send(msg);
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Failed to read frames from CAN driver: {:?}", e);
-                    break;
-                }
-            }
-        }
-    });
+    // Task to bridge CAN traffic out to the IPC pipe.
+    let mut task_out = tokio::spawn(forward_can_to_pipe(driver.clone(), tx_out_pipe));
 
     // Wait for ctrl+c OR a task finishing
     tokio::select! {

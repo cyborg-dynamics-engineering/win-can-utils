@@ -4,7 +4,7 @@ use tokio::sync::Mutex;
 
 use peak_can_sys::*;
 
-use crate::can_driver::CanDriver;
+use crate::drivers::CanDriver;
 
 /// PCAN-Basic driver backed by `peak-can-sys` (PCANBasic.dll / libpcanbasic).
 pub struct PcanDriver {
@@ -82,7 +82,7 @@ fn map_bitrate_to_const(bps: u32) -> Option<WORD> {
 #[async_trait]
 impl CanDriver for PcanDriver {
     async fn enable_timestamp(&mut self) -> std::io::Result<()> {
-        // PCAN-Basic always provides timestamps via CAN_Read’s third parameter; no switch needed. :contentReference[oaicite:3]{index=3}
+        // PCAN-Basic always provides timestamps via CAN_Read’s third parameter; no switch needed.
         Ok(())
     }
 
@@ -95,9 +95,8 @@ impl CanDriver for PcanDriver {
         })?;
         self.configured_bitrate = Some(bitrate);
 
-        // Defer actual hardware init to open_channel(), same as SLCAN pattern.
-        // We just remember the requested bitrate here.
-        // (PCAN requires calling CAN_Initialize with the baud code.) :contentReference[oaicite:4]{index=4}
+        // Defer actual hardware init to open_channel(), same as the SLCAN pattern.
+        // We just remember the requested bitrate here; CAN_Initialize uses it later.
         Ok(())
     }
 
@@ -108,7 +107,7 @@ impl CanDriver for PcanDriver {
             .and_then(map_bitrate_to_const)
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "Bitrate not set"))?;
 
-        // For PnP hardware (USB/PCI/LAN), HwType/IOPort/Interrupt are zero. :contentReference[oaicite:5]{index=5}
+        // For plug-and-play hardware (USB/PCI/LAN), HwType/IOPort/Interrupt are zero.
         let status = unsafe { CAN_Initialize(self.channel, btr_const, 0u8, 0u32, 0u16) };
         if status != PEAK_ERROR_OK {
             return Err(std::io::Error::new(
@@ -122,7 +121,7 @@ impl CanDriver for PcanDriver {
     async fn send_frame(&mut self, frame: &CanFrame) -> std::io::Result<()> {
         let _g = self.io_lock.lock().await;
 
-        // Build CANTPMsg (8-byte classic CAN). :contentReference[oaicite:6]{index=6}
+        // Build CANTPMsg (8-byte classic CAN).
         let mut msg = tagCANTPMsg {
             ID: frame.id(),
             MSGTYPE: if frame.is_extended() {
@@ -138,7 +137,7 @@ impl CanDriver for PcanDriver {
         msg.DATA[..copy_len].copy_from_slice(&data[..copy_len]);
 
         let mut msg_alias: CANTPMsg = msg; // function takes alias pointer
-        let status = unsafe { CAN_Write(self.channel, &mut msg_alias as *mut CANTPMsg) }; // :contentReference[oaicite:7]{index=7}
+        let status = unsafe { CAN_Write(self.channel, &mut msg_alias as *mut CANTPMsg) };
         if status != PEAK_ERROR_OK {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -210,7 +209,7 @@ impl CanDriver for PcanDriver {
 
     async fn close_channel(&mut self) -> std::io::Result<()> {
         let _g = self.io_lock.lock().await;
-        let status = unsafe { CAN_Uninitialize(self.channel) }; // :contentReference[oaicite:12]{index=12}
+        let status = unsafe { CAN_Uninitialize(self.channel) };
         if status != PEAK_ERROR_OK {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,

@@ -5,9 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::can_driver::CanDriver;
-use crate::gs_usb::bit_timing::{GsBtConst, parse_bt_const};
-use crate::gs_usb::context::map_libusb_error;
+use crate::drivers::CanDriver;
 use async_trait::async_trait;
 use crosscan::can::CanFrame;
 use futures::StreamExt;
@@ -15,9 +13,9 @@ use futures::stream::FuturesUnordered;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
-use super::bit_timing::{calc_bit_timing, encode_mode};
+use super::bit_timing::{GsBtConst, calc_bit_timing, encode_mode, parse_bt_const};
 use super::constants::*;
-use super::context::{LibusbContext, LibusbDeviceHandle};
+use super::context::{LibusbContext, LibusbDeviceHandle, map_libusb_error};
 use super::device::select_device;
 use super::frames::parse_host_frame_at;
 
@@ -87,7 +85,7 @@ impl UsbEventLoop {
             })
             .collect();
 
-        // track last completion time
+        // Track completion times so the debug output includes spacing between packets.
         let mut last_rx = Instant::now();
 
         loop {
@@ -117,9 +115,9 @@ impl UsbEventLoop {
                         }
                     }
 
-                    // Re-arm slot
-                    let h   = read_handle.clone();
-                    let ep  = self.in_ep;
+                    // Submit a new read for the slot we just handled.
+                    let h = read_handle.clone();
+                    let ep = self.in_ep;
                     let len = self.out_wmax.max(GS_HEADER_LEN);
                     inflight.push(Box::pin(async move {
                         (idx, h.bulk_read(ep, len, Duration::ZERO).await)
@@ -233,8 +231,8 @@ impl UsbEventLoop {
                 self.channel_index,
                 self.timestamp_enabled,
                 &mut self.last_timestamp64,
-                self.out_wmax,         // pass stored value
-                self.pad_pkts_enabled, // pass stored flag
+                self.out_wmax,
+                self.pad_pkts_enabled,
             ) {
                 None => break,
                 Some((maybe_frame, consumed)) => {
@@ -331,28 +329,39 @@ enum UsbCommand {
 
 /// High level driver used by the rest of the crate to talk to gs_usb adapters.
 pub struct GsUsbDriver {
-    // device info
+    /// Interface identifier claimed on the adapter.
     interface: u8,
+    /// Bulk IN endpoint used for RX (held for completeness).
     _in_ep: u8,
+    /// Bulk OUT endpoint used for TX submissions.
     out_ep: u8,
+    /// Optional interrupt endpoint exposed by some adapters.
     _int_ep: Option<u8>,
+    /// Selected CAN channel index.
     channel_index: u8,
+    /// Human readable description of the attached device.
     device_label: String,
 
-    // state
+    /// Bitrate chosen via CLI or auto-detection.
     configured_bitrate: Option<u32>,
+    /// Tracks whether timestamping is enabled in firmware.
     timestamp_enabled: bool,
+    /// Incremented for each transmitted frame to generate echo identifiers.
     tx_counter: AtomicU32,
 
-    // feature discovery
-    features: u32,             // feature bitmask from BT_CONST(_EXT)
-    out_wmax: u16,             // OUT endpoint wMaxPacketSize (e.g., 32)
-    pad_pkts: Arc<AtomicBool>, // true if device wants padding
+    /// Feature bitmask returned by BT_CONST/BT_CONST_EXT.
+    features: u32,
+    /// Maximum packet size supported by the OUT endpoint.
+    out_wmax: u16,
+    /// Flag toggled when PAD_PKTS handshake succeeds.
+    pad_pkts: Arc<AtomicBool>,
 
-    // async integration
+    /// Receiver half of the frame channel bridging the USB thread.
     frame_rx: Arc<Mutex<mpsc::Receiver<CanFrame>>>,
-    cmd_tx: mpsc::Sender<UsbCommand>, // to USB event loop
+    /// Command channel to the dedicated USB event loop thread.
+    cmd_tx: mpsc::Sender<UsbCommand>,
 
+    /// Cached BT_CONST descriptor for reference when changing bit timings.
     bt_const: Option<GsBtConst>,
 }
 
@@ -369,7 +378,7 @@ impl GsUsbDriver {
 
         let rc = unsafe {
             libusb1_sys::libusb_set_interface_alt_setting(
-                handle.raw(), // or expose raw pointer in your wrapper
+                handle.raw(),
                 info.interface as i32,
                 info.alt_setting as i32,
             )
@@ -385,13 +394,13 @@ impl GsUsbDriver {
             info.alt_setting
         );
 
-        // Channel: event loop <-> driver commands
+        // Channel carrying driver requests into the USB event loop.
         let (cmd_tx, cmd_rx) = mpsc::channel::<UsbCommand>(128);
 
-        // Channel: frames to async side
+        // Channel streaming decoded frames back to async callers.
         let (frame_tx, frame_rx) = mpsc::channel::<CanFrame>(1024);
 
-        // Driver instance
+        // Assemble the high-level driver state shared with async callers.
         let mut driver = GsUsbDriver {
             interface: info.interface,
             _in_ep: info.in_ep,
@@ -405,8 +414,8 @@ impl GsUsbDriver {
             tx_counter: AtomicU32::new(0),
 
             features: 0,
-            out_wmax: info.out_wmax, // candleLight FS devices: 32-byte packets
-            pad_pkts: Arc::new(AtomicBool::new(false)), // <-- start false, will adjust later
+            out_wmax: info.out_wmax,
+            pad_pkts: Arc::new(AtomicBool::new(false)),
 
             frame_rx: Arc::new(Mutex::new(frame_rx)),
             cmd_tx: cmd_tx.clone(),
@@ -437,7 +446,7 @@ impl GsUsbDriver {
             }));
         });
 
-        // === Handshake & feature discovery (through the event loop) ===
+        // Perform the handshake and discover optional firmware capabilities.
         driver.send_host_format().await?;
 
         let bt = driver.read_bt_const().await?;
@@ -445,11 +454,11 @@ impl GsUsbDriver {
         driver.bt_const = Some(bt);
         driver.out_wmax = info.out_wmax;
 
-        let _dev_conf = driver.read_device_config().await?; // validates comms
+        let _dev_conf = driver.read_device_config().await?;
         let features = driver.read_features().await.unwrap_or(0);
         driver.features = features;
 
-        // tell the event loop
+        // Let the USB thread know about negotiated padding behaviour.
         let _ = driver
             .cmd_tx
             .send(UsbCommand::UpdateConfig {
@@ -492,8 +501,7 @@ impl GsUsbDriver {
             flags |= GS_CAN_MODE_HW_TIMESTAMP;
         }
 
-        // 🔧 TEMP: disable PAD_PKTS while diagnosing (flip to true after TX path verified)
-        let enable_pad_pkts = true; // device wants 32-byte aligned
+        let enable_pad_pkts = true; // allow padding when firmware supports it
         if enable_pad_pkts && self.pad_pkts.load(Ordering::Relaxed) {
             flags |= GS_CAN_MODE_PAD_PKTS_TO_MAX_PKT_SIZE;
         }
@@ -509,7 +517,7 @@ impl GsUsbDriver {
             flags
         );
 
-        // Clean RESET → START
+        // Transition the adapter from RESET to START with the negotiated flags.
         self.cmd_control_out(
             request_type_out(),
             GS_USB_BREQ_MODE,
@@ -535,7 +543,7 @@ impl GsUsbDriver {
 
     fn maybe_pad_tx(&self, mut buf: Vec<u8>) -> Vec<u8> {
         if self.pad_pkts.load(Ordering::Relaxed) {
-            let m = self.out_wmax as usize; // ← use endpoint’s wMaxPacketSize
+            let m = self.out_wmax as usize;
             if m > 0 {
                 let rem = buf.len() % m;
                 if rem != 0 {
@@ -546,7 +554,7 @@ impl GsUsbDriver {
         buf
     }
 
-    // === Command helpers that talk to the event loop ===
+    // Helpers that proxy control and bulk messages to the USB event loop.
 
     async fn cmd_control_out(
         &self,
