@@ -2,11 +2,70 @@ use async_trait::async_trait;
 use crosscan::can::CanFrame;
 use tokio::sync::Mutex;
 
+use libloading::Library;
 use peak_can_sys::*;
+use std::sync::OnceLock;
 
 use crate::drivers::CanDriver;
 
-/// PCAN-Basic driver backed by `peak-can-sys` (PCANBasic.dll / libpcanbasic).
+type CanInitializeFn = unsafe extern "system" fn(WORD, WORD, BYTE, DWORD, WORD) -> DWORD;
+type CanUninitializeFn = unsafe extern "system" fn(WORD) -> DWORD;
+type CanWriteFn = unsafe extern "system" fn(WORD, *mut CANTPMsg) -> DWORD;
+type CanReadFn = unsafe extern "system" fn(WORD, *mut CANTPMsg, *mut CANTPTimestamp) -> DWORD;
+
+struct PcanApi {
+    can_initialize: CanInitializeFn,
+    can_uninitialize: CanUninitializeFn,
+    can_write: CanWriteFn,
+    can_read: CanReadFn,
+}
+
+static PCAN_API: OnceLock<Result<PcanApi, String>> = OnceLock::new();
+
+fn load_pcan_api() -> Result<PcanApi, String> {
+    unsafe {
+        let lib = Library::new("PCANBasic.dll")
+            .map_err(|e| format!("Failed to load PCANBasic.dll: {e}"))?;
+
+        let can_initialize = *lib
+            .get::<CanInitializeFn>(b"CAN_Initialize\0")
+            .map_err(|e| format!("Failed to load CAN_Initialize: {e}"))?;
+        let can_uninitialize = *lib
+            .get::<CanUninitializeFn>(b"CAN_Uninitialize\0")
+            .map_err(|e| format!("Failed to load CAN_Uninitialize: {e}"))?;
+        let can_write = *lib
+            .get::<CanWriteFn>(b"CAN_Write\0")
+            .map_err(|e| format!("Failed to load CAN_Write: {e}"))?;
+        let can_read = *lib
+            .get::<CanReadFn>(b"CAN_Read\0")
+            .map_err(|e| format!("Failed to load CAN_Read: {e}"))?;
+
+        // Leak the library handle so the loaded symbols remain valid for the
+        // remainder of the process. This avoids lifetime issues with the
+        // dynamically loaded module while still allowing the rest of the
+        // program to run when the DLL is absent.
+        std::mem::forget(lib);
+
+        Ok(PcanApi {
+            can_initialize,
+            can_uninitialize,
+            can_write,
+            can_read,
+        })
+    }
+}
+
+fn pcan_api() -> std::io::Result<&'static PcanApi> {
+    match PCAN_API.get_or_init(load_pcan_api) {
+        Ok(api) => Ok(api),
+        Err(err) => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            err.clone(),
+        )),
+    }
+}
+
+/// PCAN-Basic driver backed by `PCANBasic.dll` (libpcanbasic).
 pub struct PcanDriver {
     channel: WORD,
     configured_bitrate: Option<u32>,
@@ -17,6 +76,9 @@ pub struct PcanDriver {
 impl PcanDriver {
     /// Open by channel string (e.g., "USBBUS1", "PCIBUS1", "LANBUS1").
     pub async fn open(channel_name: &str) -> std::io::Result<Self> {
+        // Validate that the PCAN runtime is available before reporting success.
+        pcan_api()?;
+
         let channel = parse_channel(channel_name).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "Unknown PCAN channel")
         })?;
@@ -102,13 +164,14 @@ impl CanDriver for PcanDriver {
 
     async fn open_channel(&mut self) -> std::io::Result<()> {
         let _g = self.io_lock.lock().await;
+        let api = pcan_api()?;
         let btr_const = self
             .configured_bitrate
             .and_then(map_bitrate_to_const)
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "Bitrate not set"))?;
 
         // For plug-and-play hardware (USB/PCI/LAN), HwType/IOPort/Interrupt are zero.
-        let status = unsafe { CAN_Initialize(self.channel, btr_const, 0u8, 0u32, 0u16) };
+        let status = unsafe { (api.can_initialize)(self.channel, btr_const, 0u8, 0u32, 0u16) };
         if status != PEAK_ERROR_OK {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -120,6 +183,7 @@ impl CanDriver for PcanDriver {
 
     async fn send_frame(&mut self, frame: &CanFrame) -> std::io::Result<()> {
         let _g = self.io_lock.lock().await;
+        let api = pcan_api()?;
 
         // Build CANTPMsg (8-byte classic CAN).
         let mut msg = tagCANTPMsg {
@@ -137,7 +201,7 @@ impl CanDriver for PcanDriver {
         msg.DATA[..copy_len].copy_from_slice(&data[..copy_len]);
 
         let mut msg_alias: CANTPMsg = msg; // function takes alias pointer
-        let status = unsafe { CAN_Write(self.channel, &mut msg_alias as *mut CANTPMsg) };
+        let status = unsafe { (api.can_write)(self.channel, &mut msg_alias as *mut CANTPMsg) };
         if status != PEAK_ERROR_OK {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -149,6 +213,7 @@ impl CanDriver for PcanDriver {
 
     async fn read_frames(&mut self) -> std::io::Result<Vec<CanFrame>> {
         let _g = self.io_lock.lock().await;
+        let api = pcan_api()?;
         let mut frames = Vec::new();
 
         loop {
@@ -166,7 +231,7 @@ impl CanDriver for PcanDriver {
             };
 
             let status = unsafe {
-                CAN_Read(
+                (api.can_read)(
                     self.channel,
                     &mut msg as *mut CANTPMsg,
                     &mut ts as *mut CANTPTimestamp,
@@ -209,7 +274,8 @@ impl CanDriver for PcanDriver {
 
     async fn close_channel(&mut self) -> std::io::Result<()> {
         let _g = self.io_lock.lock().await;
-        let status = unsafe { CAN_Uninitialize(self.channel) };
+        let api = pcan_api()?;
+        let status = unsafe { (api.can_uninitialize)(self.channel) };
         if status != PEAK_ERROR_OK {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
