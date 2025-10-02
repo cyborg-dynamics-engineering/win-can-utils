@@ -16,6 +16,7 @@ use libusb1_sys::constants::{
     LIBUSB_TRANSFER_NO_DEVICE, LIBUSB_TRANSFER_OVERFLOW, LIBUSB_TRANSFER_STALL,
     LIBUSB_TRANSFER_TIMED_OUT, LIBUSB_TRANSFER_TYPE_BULK, LIBUSB_TRANSFER_TYPE_CONTROL,
 };
+use log::{debug, error, trace, warn};
 use tokio::sync::oneshot;
 
 use super::constants::duration_to_timeout;
@@ -502,6 +503,101 @@ struct BulkReadState {
 struct ControlTransferState {
     sender: Option<oneshot::Sender<io::Result<usize>>>,
     buffer: Option<Vec<u8>>,
+}
+
+struct LoopReadState {
+    buffer: Vec<u8>,
+    frame_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+const NUM_TRANSFERS: usize = 8;
+
+pub async fn spawn_bulk_read_loop(
+    handle: Arc<LibusbDeviceHandle>,
+    endpoint: u8,
+    length: usize,
+    frame_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+) -> io::Result<()> {
+    for _ in 0..NUM_TRANSFERS {
+        submit_bulk_transfer(handle.clone(), endpoint, length, frame_tx.clone())?;
+    }
+    Ok(())
+}
+
+fn submit_bulk_transfer(
+    handle: Arc<LibusbDeviceHandle>,
+    endpoint: u8,
+    length: usize,
+    frame_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+) -> io::Result<()> {
+    let state = Box::new(LoopReadState {
+        buffer: vec![0u8; length],
+        frame_tx,
+    });
+
+    let transfer = unsafe { libusb::libusb_alloc_transfer(0) };
+    if transfer.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Failed to alloc transfer",
+        ));
+    }
+
+    unsafe {
+        (*transfer).dev_handle = handle.raw();
+        (*transfer).endpoint = endpoint;
+        (*transfer).transfer_type = LIBUSB_TRANSFER_TYPE_BULK;
+        (*transfer).timeout = 0; // no timeout, let device push
+        (*transfer).callback = loop_read_callback;
+        (*transfer).user_data = Box::into_raw(state) as *mut c_void;
+
+        let buf_ref = &mut (*((*transfer).user_data as *mut LoopReadState)).buffer;
+        (*transfer).buffer = buf_ref.as_mut_ptr();
+        (*transfer).length = buf_ref.len() as c_int;
+    }
+
+    let submit = unsafe { libusb::libusb_submit_transfer(transfer) };
+    if submit < 0 {
+        unsafe { libusb::libusb_free_transfer(transfer) };
+        return Err(map_libusb_error(submit));
+    }
+    Ok(())
+}
+
+extern "system" fn loop_read_callback(transfer: *mut libusb::libusb_transfer) {
+    unsafe {
+        let state_ptr = (*transfer).user_data as *mut LoopReadState;
+        let state = &mut *state_ptr;
+
+        if (*transfer).status == libusb1_sys::constants::LIBUSB_TRANSFER_COMPLETED {
+            let len = (*transfer).actual_length as usize;
+            if len > 0 {
+                let mut frame = vec![0u8; len];
+                frame.copy_from_slice(&state.buffer[..len]);
+
+                debug!(
+                    "bulk_rx: got {} bytes (endpoint=0x{:02x})",
+                    len,
+                    (*transfer).endpoint
+                );
+
+                let _ = state.frame_tx.try_send(frame);
+            }
+        } else {
+            warn!(
+                "bulk_rx error: status={} actual_length={}",
+                (*transfer).status,
+                (*transfer).actual_length
+            );
+        }
+
+        // Resubmit so pipeline stays full
+        let res = libusb::libusb_submit_transfer(transfer);
+        if res < 0 {
+            error!("libusb resubmit failed: {:?}", res);
+            libusb::libusb_free_transfer(transfer);
+        }
+    }
 }
 
 extern "system" fn bulk_write_callback(transfer: *mut libusb::libusb_transfer) {
