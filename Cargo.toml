@@ -23,6 +23,7 @@ async-trait = "0.1.89"
 tokio-serial = "5.4.5"
 bincode = { version = "2.0.1", features = ["serde"] }
 peak-can-sys = "0.1.2"
+libloading = "0.8"
 memchr = "2.7.4"
 libusb1-sys = "0.7"
 libc = "0.2"
