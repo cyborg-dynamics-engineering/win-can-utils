@@ -308,9 +308,7 @@ async fn forward_can_to_pipe(
                         }
                         let mut msg = vec![data.len() as u8];
                         msg.append(&mut data);
-                        if let Err(err) = tx_out_pipe.try_send(msg) {
-                            eprintln!("Failed to queue frame for IPC writer: {:?}", err);
-                        }
+                        let _ = tx_out_pipe.try_send(msg);
                     }
                 }
             }
