@@ -1,5 +1,6 @@
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9,7 +10,10 @@ use crate::gs_usb::bit_timing::{GsBtConst, parse_bt_const};
 use crate::gs_usb::context::map_libusb_error;
 use async_trait::async_trait;
 use crosscan::can::CanFrame;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 
 use super::bit_timing::{calc_bit_timing, encode_mode};
 use super::constants::*;
@@ -34,6 +38,8 @@ struct UsbEventLoop {
     last_timestamp64: Option<u64>,
     channel_index: u8,
     timestamp_enabled: bool,
+    out_wmax: usize,
+    pad_pkts_enabled: bool,
 }
 
 impl UsbEventLoop {
@@ -44,6 +50,8 @@ impl UsbEventLoop {
         out_ep: u8,
         cmd_rx: mpsc::Receiver<UsbCommand>,
         frame_tx: mpsc::Sender<CanFrame>,
+        out_wmax: usize,
+        pad_pkts_enabled: bool,
     ) -> Self {
         Self {
             handle,
@@ -56,38 +64,66 @@ impl UsbEventLoop {
             last_timestamp64: None,
             channel_index: 0,
             timestamp_enabled: false,
+            out_wmax,
+            pad_pkts_enabled,
         }
     }
 
+    const NUM_RX_TRANSFERS: usize = 8;
+
     async fn run(mut self) -> io::Result<()> {
-        // Keep a dedicated handle reference alive for the in-flight bulk read
-        // future so that we can continue issuing control requests through
-        // `self.handle` while the transfer is pending.
         let read_handle = self.handle.clone();
-        let mut rx_transfer =
-            Box::pin(read_handle.bulk_read(self.in_ep, USB_READ_BYTES, Duration::ZERO));
+
+        type BoxedReadFuture = Pin<Box<dyn Future<Output = (usize, io::Result<Vec<u8>>)> + Send>>;
+
+        let mut inflight: FuturesUnordered<BoxedReadFuture> = (0..Self::NUM_RX_TRANSFERS)
+            .map(|i| {
+                let h = read_handle.clone();
+                let ep = self.in_ep;
+                let len = self.out_wmax.max(GS_HEADER_LEN);
+
+                Box::pin(async move { (i, h.bulk_read(ep, len, Duration::ZERO).await) })
+                    as BoxedReadFuture
+            })
+            .collect();
+
+        // track last completion time
+        let mut last_rx = Instant::now();
 
         loop {
             tokio::select! {
-                biased;
-
                 maybe_cmd = self.cmd_rx.recv() => {
-                    let Some(command) = maybe_cmd else {
-                        return Ok(());
-                    };
-
-                    if !self.handle_command(command).await? {
-                        return Ok(());
-                    }
+                    let Some(command) = maybe_cmd else { return Ok(()); };
+                    if !self.handle_command(command).await? { return Ok(()); }
                 }
 
-                result = &mut rx_transfer => {
-                    self.handle_rx_completion(result).await?;
-                    rx_transfer = Box::pin(read_handle.bulk_read(
-                        self.in_ep,
-                        USB_READ_BYTES,
-                        Duration::ZERO,
-                    ));
+                Some((idx, result)) = inflight.next() => {
+                    let now = Instant::now();
+                    let delta = now.duration_since(last_rx);
+                    last_rx = now;
+
+                    match result {
+                        Ok(buf) => {
+                            log::debug!(
+                                "RX transfer {} completed: {} bytes, Δt={:?}",
+                                idx,
+                                buf.len(),
+                                delta
+                            );
+                            self.handle_rx_completion(Ok(buf)).await?;
+                        }
+                        Err(e) => {
+                            log::error!("RX transfer {} failed: {:?}, Δt={:?}", idx, e, delta);
+                        }
+                    }
+
+                    // Re-arm slot
+                    let h   = read_handle.clone();
+                    let ep  = self.in_ep;
+                    let len = self.out_wmax.max(GS_HEADER_LEN);
+                    inflight.push(Box::pin(async move {
+                        (idx, h.bulk_read(ep, len, Duration::ZERO).await)
+                    }) as BoxedReadFuture);
                 }
             }
         }
@@ -149,6 +185,14 @@ impl UsbEventLoop {
                 let _ = resp.send(result);
                 Ok(true)
             }
+            UsbCommand::UpdateConfig {
+                out_wmax,
+                pad_pkts_enabled,
+            } => {
+                self.out_wmax = out_wmax;
+                self.pad_pkts_enabled = pad_pkts_enabled;
+                Ok(true)
+            }
             UsbCommand::BulkWrite {
                 endpoint,
                 data,
@@ -189,6 +233,8 @@ impl UsbEventLoop {
                 self.channel_index,
                 self.timestamp_enabled,
                 &mut self.last_timestamp64,
+                self.out_wmax,         // pass stored value
+                self.pad_pkts_enabled, // pass stored flag
             ) {
                 None => break,
                 Some((maybe_frame, consumed)) => {
@@ -277,6 +323,10 @@ enum UsbCommand {
     },
     #[allow(dead_code)]
     Shutdown,
+    UpdateConfig {
+        out_wmax: usize,
+        pad_pkts_enabled: bool,
+    },
 }
 
 /// High level driver used by the rest of the crate to talk to gs_usb adapters.
@@ -380,6 +430,8 @@ impl GsUsbDriver {
                     info.out_ep,
                     cmd_rx,
                     frame_tx,
+                    info.out_wmax as usize,
+                    false,
                 );
                 let _ = runtime.block_on(event_loop.run());
             }));
@@ -396,7 +448,16 @@ impl GsUsbDriver {
         let _dev_conf = driver.read_device_config().await?; // validates comms
         let features = driver.read_features().await.unwrap_or(0);
         driver.features = features;
-        info!("Features bitmask: {:#010x}", features);
+
+        // tell the event loop
+        let _ = driver
+            .cmd_tx
+            .send(UsbCommand::UpdateConfig {
+                out_wmax: info.out_wmax as usize,
+                pad_pkts_enabled: (features & GS_CAN_FEATURE_PAD_PKTS_TO_MAX_PKT_SIZE) != 0,
+            })
+            .await;
+
         driver.out_wmax = info.out_wmax;
 
         driver.pad_pkts = Arc::new(AtomicBool::new(
@@ -474,7 +535,7 @@ impl GsUsbDriver {
 
     fn maybe_pad_tx(&self, mut buf: Vec<u8>) -> Vec<u8> {
         if self.pad_pkts.load(Ordering::Relaxed) {
-            let m = self.out_wmax as usize;
+            let m = self.out_wmax as usize; // ← use endpoint’s wMaxPacketSize
             if m > 0 {
                 let rem = buf.len() % m;
                 if rem != 0 {
@@ -926,16 +987,33 @@ impl GsUsbDriver {
 #[async_trait]
 impl CanDriver for GsUsbDriver {
     async fn enable_timestamp(&mut self) -> io::Result<()> {
-        self.cmd_control_out(
-            request_type_out(),
-            GS_USB_BREQ_TIMESTAMP,
-            self.channel_index as u16, // value = channel
-            self.interface as u16,     // index = interface
-            1u32.to_le_bytes().to_vec(),
-        )
-        .await?;
-        self.timestamp_enabled = true;
-        Ok(())
+        let res = self
+            .cmd_control_out(
+                request_type_out(),
+                GS_USB_BREQ_TIMESTAMP,
+                self.channel_index as u16,
+                self.interface as u16,
+                1u32.to_le_bytes().to_vec(),
+            )
+            .await;
+
+        match res {
+            Ok(_) => {
+                info!("BREQ_TIMESTAMP accepted by device");
+                self.timestamp_enabled = true;
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                warn!("Device ignored BREQ_TIMESTAMP (timeout); falling back to MODE flag only");
+                self.timestamp_enabled = true; // ensures MODE flag is set later
+                Ok(())
+            }
+            Err(e) => {
+                warn!("BREQ_TIMESTAMP not supported: {e}, falling back to MODE flag only");
+                self.timestamp_enabled = true;
+                Ok(())
+            }
+        }
     }
 
     async fn set_bitrate(&mut self, bitrate: u32) -> io::Result<()> {
