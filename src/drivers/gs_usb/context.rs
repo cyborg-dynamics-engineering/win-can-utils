@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::ffi::CStr;
 use std::io;
 use std::mem::MaybeUninit;
@@ -16,7 +18,7 @@ use libusb1_sys::constants::{
     LIBUSB_TRANSFER_NO_DEVICE, LIBUSB_TRANSFER_OVERFLOW, LIBUSB_TRANSFER_STALL,
     LIBUSB_TRANSFER_TIMED_OUT, LIBUSB_TRANSFER_TYPE_BULK, LIBUSB_TRANSFER_TYPE_CONTROL,
 };
-use log::{debug, error, trace, warn};
+use log::{debug, error, warn};
 use tokio::sync::oneshot;
 
 use super::constants::duration_to_timeout;
