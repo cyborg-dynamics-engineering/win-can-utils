@@ -19,7 +19,7 @@ use super::context::{LibusbContext, LibusbDeviceHandle, map_libusb_error};
 use super::device::select_device;
 use super::frames::parse_host_frame_at;
 
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 /// State owned by the dedicated USB thread.
 ///
 /// The gs_usb protocol requires that all libusb operations are serialized from a

@@ -1,10 +1,7 @@
 use crosscan::can::CanFrame;
 use log::{debug, trace, warn};
 
-use super::constants::{
-    CAN_EFF_FLAG, CAN_EFF_MASK, CAN_ERR_FLAG, CAN_ERR_MASK, CAN_RTR_FLAG, CAN_SFF_MASK,
-    GS_CAN_ECHO_ID_UNUSED, GS_HEADER_LEN, GS_MAX_DATA, GS_MAX_FRAME_LEN,
-};
+use super::constants::GS_HEADER_LEN;
 
 #[inline]
 fn dlc_to_len(dlc: u8) -> usize {

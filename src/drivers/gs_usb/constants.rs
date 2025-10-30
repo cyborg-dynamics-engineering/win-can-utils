@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use libusb1_sys::constants::{
     LIBUSB_ENDPOINT_IN, LIBUSB_ENDPOINT_OUT, LIBUSB_RECIPIENT_INTERFACE, LIBUSB_REQUEST_TYPE_VENDOR,
 };
