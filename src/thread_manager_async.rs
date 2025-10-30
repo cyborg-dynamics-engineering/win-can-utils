@@ -71,7 +71,7 @@ pub async fn start_ipc_writer(
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct CanServerConfig {
-    pub bitrate: u32,
+    pub bitrate: Option<u32>,
 }
 
 pub async fn start_ipc_config_handler(

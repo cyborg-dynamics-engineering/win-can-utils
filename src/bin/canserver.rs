@@ -275,7 +275,7 @@ fn spawn_ipc_tasks(
 
     tokio::spawn(async move {
         let config = thread_manager_async::CanServerConfig {
-            bitrate: driver.lock().await.get_bitrate().await.unwrap_or(0),
+            bitrate: driver.lock().await.get_bitrate().await,
         };
         if let Err(e) = thread_manager_async::start_ipc_config_handler(channel_name, config).await {
             eprintln!("Encounted error when sending Config {:?}", e);
