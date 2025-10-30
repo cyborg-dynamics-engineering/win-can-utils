@@ -256,7 +256,10 @@ async fn initialize_driver(cli: &Cli) -> std::io::Result<Box<dyn CanDriver>> {
 ///
 /// The caller receives the sender towards the writer and the receiver from the
 /// reader so it can bridge the IPC traffic with the CAN driver.
-fn spawn_ipc_tasks(channel_name: String) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+fn spawn_ipc_tasks(
+    channel_name: String,
+    driver: Arc<Mutex<Box<dyn CanDriver>>>,
+) -> std::io::Result<(mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>)> {
     let (tx_out_pipe, rx_out_pipe) = mpsc::channel::<Vec<u8>>(100);
     let (tx_in_pipe, rx_in_pipe) = mpsc::channel::<Vec<u8>>(100);
 
@@ -266,11 +269,20 @@ fn spawn_ipc_tasks(channel_name: String) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiv
     ));
 
     tokio::spawn(thread_manager_async::start_ipc_writer(
-        channel_name,
+        channel_name.clone(),
         rx_out_pipe,
     ));
 
-    (tx_out_pipe, rx_in_pipe)
+    tokio::spawn(async move {
+        let config = thread_manager_async::CanServerConfig {
+            bitrate: driver.lock().await.get_bitrate().await.unwrap_or(0),
+        };
+        if let Err(e) = thread_manager_async::start_ipc_config_handler(channel_name, config).await {
+            eprintln!("Encounted error when sending Config {:?}", e);
+        }
+    });
+
+    Ok((tx_out_pipe, rx_in_pipe))
 }
 
 /// Consume CAN frames received from the IPC pipe and forward them to the driver.
@@ -340,7 +352,7 @@ async fn main() -> std::io::Result<()> {
         }
     };
 
-    let (tx_out_pipe, rx_in_pipe) = spawn_ipc_tasks(channel_name.clone());
+    let (tx_out_pipe, rx_in_pipe) = spawn_ipc_tasks(channel_name.clone(), driver.clone())?;
 
     println!("\nCreated CAN server: {}", channel_name);
 

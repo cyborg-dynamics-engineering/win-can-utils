@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::io::ErrorKind;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
@@ -65,5 +66,33 @@ pub async fn start_ipc_writer(
                 return Ok(());
             }
         }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct CanServerConfig {
+    pub bitrate: u32,
+}
+
+pub async fn start_ipc_config_handler(
+    channel_name: String,
+    config: CanServerConfig,
+) -> std::io::Result<()> {
+    let pipe_name = format!(r"\\.\pipe\can_{}_config_out", channel_name);
+    loop {
+        let mut server = create_server_and_wait(&pipe_name).await?;
+
+        let data = serde_json::to_vec(&config)?;
+
+        if data.len() > (u8::MAX as usize) {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("Serialized Config is too large: {}", data.len()).to_string(),
+            ));
+        }
+
+        server.write_all(&data).await?;
+        server.flush().await?;
+        server.shutdown().await?;
     }
 }
