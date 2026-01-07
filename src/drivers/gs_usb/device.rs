@@ -179,6 +179,10 @@ pub(crate) fn select_device(
             }
         };
 
+        if !(desc.idProduct == 0x606F && desc.idVendor == 0x1D50) {
+            continue;
+        }
+
         let info = match unsafe { find_gs_usb_interface(device) } {
             Ok(Some(info)) => info,
             Ok(None) => continue,
