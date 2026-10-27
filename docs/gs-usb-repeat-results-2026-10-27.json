@@ -1,0 +1,230 @@
+{
+  "date": "2026-10-27",
+  "saved_at": "2026-10-27T16:46:31.574906+10:00",
+  "logical_processors": 8,
+  "duration": "60 seconds submitting per direction, followed by queue drain",
+  "frame": "Classic CAN, standard ID 0x5a0, DLC 8, little-endian sequence and inverse",
+  "adapters": {
+    "loadA": {
+      "id": "003:014/0",
+      "product": "SH-C31x (SH-C31A)",
+      "serial": "0021002D3133500F20313355",
+      "backend": "WinUSB"
+    },
+    "loadB": {
+      "id": "003:019/0",
+      "product": "canable gs_usb",
+      "serial": "002F00165046570120333836",
+      "backend": "WinUSB"
+    }
+  },
+  "comparison_note": "CANable changed from libusbK in the first run to WinUSB in this repeat. USB address changed from 003:015/0 to 003:019/0. No Windows driver bindings were changed by the test harness.",
+  "builds": {
+    "canserver_sha256": "0144a38cc1985a9f09f63de89e927341c930027a5382ed7563387dc673a28551",
+    "load_example_sha256": "99431994f756a74b53d1b49325fa03ad3ce4b801b4a90d3ea5bfe23db477c40e"
+  },
+  "runs": [
+    {
+      "label": "repeat-1M",
+      "results": [
+        {
+          "bad_payloads": 0,
+          "bitrate": 1000000,
+          "bus_load_max_percent": 61.789450463690756,
+          "bus_load_min_percent": 50.80465927014573,
+          "destination": "loadB",
+          "duplicates": 0,
+          "error_frames": 0,
+          "missing": 0,
+          "missing_sample": [],
+          "other_frames": 0,
+          "out_of_order": 0,
+          "read_error": null,
+          "receive_seconds": 61.0245191,
+          "received": 279310,
+          "received_fps": 4576.996330643759,
+          "requested_fps": 0,
+          "send_seconds": 60.0411959,
+          "source": "loadA",
+          "submitted": 279310,
+          "success": true,
+          "timestamp_regressions": 0,
+          "timestamped": 279310,
+          "write_error": null,
+          "exit_code": 0,
+          "stderr": "",
+          "measured_seconds": 61.586743699997896,
+          "devices": {
+            "loadA": "003:014/0",
+            "loadB": "003:019/0"
+          },
+          "server_cpu": [
+            {
+              "name": "loadA",
+              "cpu_seconds": 17.09375,
+              "percent_one_core": 27.755567144883138,
+              "percent_machine": 3.469445893110392
+            },
+            {
+              "name": "loadB",
+              "cpu_seconds": 10.625,
+              "percent_one_core": 17.252089267386225,
+              "percent_machine": 2.156511158423278
+            }
+          ]
+        },
+        {
+          "bad_payloads": 0,
+          "bitrate": 1000000,
+          "bus_load_max_percent": 95.95691162328674,
+          "bus_load_min_percent": 78.89790511248022,
+          "destination": "loadA",
+          "duplicates": 0,
+          "error_frames": 0,
+          "missing": 0,
+          "missing_sample": [],
+          "other_frames": 0,
+          "out_of_order": 0,
+          "read_error": null,
+          "receive_seconds": 60.5661062,
+          "received": 430500,
+          "received_fps": 7107.919379502722,
+          "requested_fps": 0,
+          "send_seconds": 60.000004,
+          "source": "loadB",
+          "submitted": 430500,
+          "success": true,
+          "timestamp_regressions": 0,
+          "timestamped": 430500,
+          "write_error": null,
+          "exit_code": 0,
+          "stderr": "",
+          "measured_seconds": 61.142741699994076,
+          "devices": {
+            "loadA": "003:014/0",
+            "loadB": "003:019/0"
+          },
+          "server_cpu": [
+            {
+              "name": "loadA",
+              "cpu_seconds": 17.3125,
+              "percent_one_core": 28.31488990949465,
+              "percent_machine": 3.539361238686831
+            },
+            {
+              "name": "loadB",
+              "cpu_seconds": 23.859375,
+              "percent_one_core": 39.022415967327014,
+              "percent_machine": 4.877801995915877
+            }
+          ]
+        }
+      ],
+      "server_error_logs": {
+        "loadA": "",
+        "loadB": ""
+      }
+    },
+    {
+      "label": "repeat-125k",
+      "results": [
+        {
+          "bad_payloads": 0,
+          "bitrate": 125000,
+          "bus_load_max_percent": 100.0,
+          "bus_load_min_percent": 91.33443692205675,
+          "destination": "loadB",
+          "duplicates": 0,
+          "error_frames": 0,
+          "missing": 0,
+          "missing_sample": [],
+          "other_frames": 0,
+          "out_of_order": 0,
+          "read_error": null,
+          "receive_seconds": 64.3474619,
+          "received": 66185,
+          "received_fps": 1028.540956329468,
+          "requested_fps": 0,
+          "send_seconds": 60.1684708,
+          "source": "loadA",
+          "submitted": 66185,
+          "success": true,
+          "timestamp_regressions": 0,
+          "timestamped": 66185,
+          "write_error": null,
+          "exit_code": 0,
+          "stderr": "",
+          "measured_seconds": 64.96110079999198,
+          "devices": {
+            "loadA": "003:014/0",
+            "loadB": "003:019/0"
+          },
+          "server_cpu": [
+            {
+              "name": "loadA",
+              "cpu_seconds": 6.5625,
+              "percent_one_core": 10.10219949967475,
+              "percent_machine": 1.2627749374593438
+            },
+            {
+              "name": "loadB",
+              "cpu_seconds": 3.875,
+              "percent_one_core": 5.965108275998424,
+              "percent_machine": 0.745638534499803
+            }
+          ]
+        },
+        {
+          "bad_payloads": 0,
+          "bitrate": 125000,
+          "bus_load_max_percent": 100.0,
+          "bus_load_min_percent": 92.03622269624535,
+          "destination": "loadA",
+          "duplicates": 0,
+          "error_frames": 0,
+          "missing": 0,
+          "missing_sample": [],
+          "other_frames": 0,
+          "out_of_order": 0,
+          "read_error": null,
+          "receive_seconds": 64.2784398,
+          "received": 66622,
+          "received_fps": 1036.4439492820422,
+          "requested_fps": 0,
+          "send_seconds": 60.215893,
+          "source": "loadB",
+          "submitted": 66622,
+          "success": true,
+          "timestamp_regressions": 0,
+          "timestamped": 66622,
+          "write_error": null,
+          "exit_code": 0,
+          "stderr": "",
+          "measured_seconds": 64.89271140001074,
+          "devices": {
+            "loadA": "003:014/0",
+            "loadB": "003:019/0"
+          },
+          "server_cpu": [
+            {
+              "name": "loadA",
+              "cpu_seconds": 3.40625,
+              "percent_one_core": 5.249048662804736,
+              "percent_machine": 0.656131082850592
+            },
+            {
+              "name": "loadB",
+              "cpu_seconds": 6.234375,
+              "percent_one_core": 9.607203745225181,
+              "percent_machine": 1.2009004681531477
+            }
+          ]
+        }
+      ],
+      "server_error_logs": {
+        "loadA": "",
+        "loadB": ""
+      }
+    }
+  ]
+}

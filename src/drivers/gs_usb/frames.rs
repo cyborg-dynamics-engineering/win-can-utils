@@ -1,5 +1,4 @@
 use crosscan::can::CanFrame;
-use log::{debug, trace, warn};
 
 use super::constants::GS_HEADER_LEN;
 
@@ -102,6 +101,9 @@ pub(crate) fn parse_host_frame_at(
 
     // If timestamp is expected, require +4 bytes
     let mut consumed = base;
+    if bytes.len() < base {
+        return None;
+    }
     if timestamp_enabled {
         if bytes.len() < base + 4 {
             trace!(
@@ -194,4 +196,48 @@ pub(crate) fn parse_host_frame_at(
         raw_id, dlc, data_len, pad_pkts_enabled, out_wmax, consumed
     );
     Some((Some(frame), consumed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_padded_classic_record_on_fd_adapter_has_one_frame_and_timestamp() {
+        let mut bytes = vec![0; 128];
+        bytes[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[4..8].copy_from_slice(&0x123u32.to_le_bytes());
+        bytes[8] = 8;
+        bytes[12..20].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        bytes[20..24].copy_from_slice(&42u32.to_le_bytes());
+        let mut timestamp = None;
+        for split in 0..128 {
+            assert!(
+                parse_host_frame_at(&bytes[..split], 0, true, &mut timestamp, 128, true).is_none()
+            );
+        }
+        let (frame, consumed) =
+            parse_host_frame_at(&bytes, 0, true, &mut timestamp, 128, true).unwrap();
+        let frame = frame.unwrap();
+        assert_eq!(consumed, 128);
+        assert_eq!(frame.id(), 0x123);
+        assert_eq!(frame.data(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(frame.timestamp(), Some(42));
+    }
+
+    #[test]
+    fn incomplete_frame_without_timestamp_waits_for_payload() {
+        let mut bytes = [0; 20];
+        bytes[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[8] = 8;
+        for split in 0..20 {
+            assert!(parse_host_frame_at(&bytes[..split], 0, false, &mut None, 0, false).is_none());
+        }
+        assert!(
+            parse_host_frame_at(&bytes, 0, false, &mut None, 0, false)
+                .unwrap()
+                .0
+                .is_some()
+        );
+    }
 }

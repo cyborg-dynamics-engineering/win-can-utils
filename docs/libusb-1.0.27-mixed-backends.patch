@@ -1,0 +1,23 @@
+--- a/libusb/libusb/os/windows_winusb.c
++++ b/libusb/libusb/os/windows_winusb.c
+@@ -2588,7 +2588,9 @@
+ 	// WinUSB requires a separate handle for each interface
+ 	for (i = 0; i < USB_MAXINTERFACES; i++) {
+ 		if ((priv->usb_interface[i].path != NULL)
+-				&& (priv->usb_interface[i].apib->id == USB_API_WINUSBX)) {
++				&& (priv->usb_interface[i].apib->id == USB_API_WINUSBX)
++				&& (priv->apib->id != USB_API_COMPOSITE
++					|| priv->usb_interface[i].sub_api == sub_api)) {
+ 			file_handle = windows_open(dev_handle, priv->usb_interface[i].path, GENERIC_READ | GENERIC_WRITE);
+ 			if (file_handle == INVALID_HANDLE_VALUE) {
+ 				usbi_err(HANDLE_CTX(dev_handle), "could not open device %s (interface %d): %s", priv->usb_interface[i].path, i, windows_error_str(0));
+@@ -2630,7 +2632,8 @@
+ 		// are NOT the first within that group (i.e. not bFirstInterface),
+ 		// then free & close bFirstInterface last.
+ 		for (i = 0; i < USB_MAXINTERFACES; i++) {
+-			if (priv->usb_interface[i].apib->id == USB_API_WINUSBX) {
++			if (priv->usb_interface[i].apib->id == USB_API_WINUSBX
++					&& priv->usb_interface[i].sub_api == sub_api) {
+ 				if (priv->usb_interface[i].num_associated_interfaces == 0) {
+ 					handle = handle_priv->interface_handle[i].api_handle;
+ 					if (HANDLE_VALID(handle))

@@ -6,4 +6,5 @@ mod device;
 mod driver;
 mod frames;
 
+pub use device::GsUsbAdapter;
 pub use driver::GsUsbDriver;

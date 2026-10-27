@@ -1,0 +1,131 @@
+{
+  "date": "2026-10-27",
+  "method": "Separate temporary build under target/gsusb-profile-src; aggregate nanosecond timers around each blocking USB write, echo-slot acquisition, and complete send_frame call; logged every 5000 sends. No transmit scheduling changes.",
+  "bitrate": 1000000,
+  "duration": "10 seconds submission per direction plus drain",
+  "backends": {
+    "loadA": "WinUSB",
+    "loadB": "WinUSB"
+  },
+  "binaries": {
+    "diagnostic_canserver_sha256": "bce52d9f04530035c35fcf2efc600e12653c9e4305eeaffbd7d68c4e1e4a131b",
+    "normal_canserver_sha256": "0144a38cc1985a9f09f63de89e927341c930027a5382ed7563387dc673a28551"
+  },
+  "metrics": {
+    "loadA": {
+      "frames": 45000.0,
+      "record_bytes": 76.0,
+      "mean_send_us": 219.812,
+      "mean_usb_write_us": 206.008,
+      "mean_echo_wait_us": 0.472,
+      "max_usb_write_us": 37683.2,
+      "usb_fraction_percent": 93.72008807526431,
+      "other_send_overhead_us": 13.332000000000003
+    },
+    "loadB": {
+      "frames": 75000.0,
+      "record_bytes": 20.0,
+      "mean_send_us": 137.486,
+      "mean_usb_write_us": 124.629,
+      "mean_echo_wait_us": 0.432,
+      "max_usb_write_us": 28879.3,
+      "usb_fraction_percent": 90.64850239297093,
+      "other_send_overhead_us": 12.424999999999985
+    }
+  },
+  "end_to_end": [
+    {
+      "bad_payloads": 0,
+      "bitrate": 1000000,
+      "bus_load_max_percent": 61.34299126531418,
+      "bus_load_min_percent": 50.437570595924996,
+      "destination": "loadB",
+      "duplicates": 0,
+      "error_frames": 0,
+      "missing": 0,
+      "missing_sample": [],
+      "other_frames": 0,
+      "out_of_order": 0,
+      "read_error": null,
+      "receive_seconds": 10.9051089,
+      "received": 49553,
+      "received_fps": 4543.925278912162,
+      "requested_fps": 0,
+      "send_seconds": 10.0190909,
+      "source": "loadA",
+      "submitted": 49553,
+      "success": true,
+      "timestamp_regressions": 0,
+      "timestamped": 49553,
+      "write_error": null,
+      "exit_code": 0,
+      "stderr": "",
+      "measured_seconds": 11.462961600002018,
+      "devices": {
+        "loadA": "003:014/0",
+        "loadB": "003:019/0"
+      },
+      "server_cpu": [
+        {
+          "name": "loadA",
+          "cpu_seconds": 2.828125,
+          "percent_one_core": 24.67185269118848
+        },
+        {
+          "name": "loadB",
+          "cpu_seconds": 1.734375,
+          "percent_one_core": 15.130252202883543
+        }
+      ]
+    },
+    {
+      "bad_payloads": 0,
+      "bitrate": 1000000,
+      "bus_load_max_percent": 97.50337831957992,
+      "bus_load_min_percent": 80.16944439609904,
+      "destination": "loadA",
+      "duplicates": 0,
+      "error_frames": 0,
+      "missing": 0,
+      "missing_sample": [],
+      "other_frames": 0,
+      "out_of_order": 0,
+      "read_error": null,
+      "receive_seconds": 10.5778181,
+      "received": 76399,
+      "received_fps": 7222.472468117031,
+      "requested_fps": 0,
+      "send_seconds": 10.0112883,
+      "source": "loadB",
+      "submitted": 76399,
+      "success": true,
+      "timestamp_regressions": 0,
+      "timestamped": 76399,
+      "write_error": null,
+      "exit_code": 0,
+      "stderr": "",
+      "measured_seconds": 11.144108499996946,
+      "devices": {
+        "loadA": "003:014/0",
+        "loadB": "003:019/0"
+      },
+      "server_cpu": [
+        {
+          "name": "loadA",
+          "cpu_seconds": 3.046875,
+          "percent_one_core": 27.340679606635515
+        },
+        {
+          "name": "loadB",
+          "cpu_seconds": 4.546875,
+          "percent_one_core": 40.800706489902225
+        }
+      ]
+    }
+  ],
+  "interpretation": "Serialized USB OUT completion is the observed bottleneck. USB call time includes Windows/backend/controller scheduling and device-side readiness; these were not separately measured. Echo-slot wait and IPC/driver scheduling are much smaller.",
+  "logs": {
+    "loadA": "[2026-10-27T06:46:46Z INFO  gsusb_profile] frames=5000 record_bytes=76 mean_send_us=212.932 mean_usb_write_us=199.620 mean_echo_wait_us=0.466 max_usb_write_us=1444.200\n[2026-10-27T06:46:47Z INFO  gsusb_profile] frames=10000 record_bytes=76 mean_send_us=216.009 mean_usb_write_us=202.562 mean_echo_wait_us=0.465 max_usb_write_us=21764.900\n[2026-10-27T06:46:48Z INFO  gsusb_profile] frames=15000 record_bytes=76 mean_send_us=215.112 mean_usb_write_us=201.528 mean_echo_wait_us=0.465 max_usb_write_us=21764.900\n[2026-10-27T06:46:49Z INFO  gsusb_profile] frames=20000 record_bytes=76 mean_send_us=214.701 mean_usb_write_us=201.128 mean_echo_wait_us=0.465 max_usb_write_us=21764.900\n[2026-10-27T06:46:50Z INFO  gsusb_profile] frames=25000 record_bytes=76 mean_send_us=213.971 mean_usb_write_us=200.376 mean_echo_wait_us=0.468 max_usb_write_us=21764.900\n[2026-10-27T06:46:52Z INFO  gsusb_profile] frames=30000 record_bytes=76 mean_send_us=217.553 mean_usb_write_us=203.961 mean_echo_wait_us=0.470 max_usb_write_us=37683.200\n[2026-10-27T06:46:53Z INFO  gsusb_profile] frames=35000 record_bytes=76 mean_send_us=221.233 mean_usb_write_us=207.456 mean_echo_wait_us=0.471 max_usb_write_us=37683.200\n[2026-10-27T06:46:54Z INFO  gsusb_profile] frames=40000 record_bytes=76 mean_send_us=220.677 mean_usb_write_us=206.831 mean_echo_wait_us=0.472 max_usb_write_us=37683.200\n[2026-10-27T06:46:55Z INFO  gsusb_profile] frames=45000 record_bytes=76 mean_send_us=219.812 mean_usb_write_us=206.008 mean_echo_wait_us=0.472 max_usb_write_us=37683.200\n",
+    "loadB": "[2026-10-27T06:46:58Z INFO  gsusb_profile] frames=5000 record_bytes=20 mean_send_us=136.618 mean_usb_write_us=123.939 mean_echo_wait_us=0.457 max_usb_write_us=341.300\n[2026-10-27T06:46:59Z INFO  gsusb_profile] frames=10000 record_bytes=20 mean_send_us=136.679 mean_usb_write_us=123.824 mean_echo_wait_us=0.448 max_usb_write_us=397.800\n[2026-10-27T06:46:59Z INFO  gsusb_profile] frames=15000 record_bytes=20 mean_send_us=136.496 mean_usb_write_us=123.642 mean_echo_wait_us=0.440 max_usb_write_us=2353.400\n[2026-10-27T06:47:00Z INFO  gsusb_profile] frames=20000 record_bytes=20 mean_send_us=136.830 mean_usb_write_us=123.834 mean_echo_wait_us=0.439 max_usb_write_us=2353.400\n[2026-10-27T06:47:01Z INFO  gsusb_profile] frames=25000 record_bytes=20 mean_send_us=136.986 mean_usb_write_us=123.971 mean_echo_wait_us=0.439 max_usb_write_us=2353.400\n[2026-10-27T06:47:02Z INFO  gsusb_profile] frames=30000 record_bytes=20 mean_send_us=137.066 mean_usb_write_us=124.063 mean_echo_wait_us=0.439 max_usb_write_us=2353.400\n[2026-10-27T06:47:02Z INFO  gsusb_profile] frames=35000 record_bytes=20 mean_send_us=136.915 mean_usb_write_us=124.015 mean_echo_wait_us=0.439 max_usb_write_us=2353.400\n[2026-10-27T06:47:03Z INFO  gsusb_profile] frames=40000 record_bytes=20 mean_send_us=137.276 mean_usb_write_us=124.467 mean_echo_wait_us=0.436 max_usb_write_us=18247.100\n[2026-10-27T06:47:04Z INFO  gsusb_profile] frames=45000 record_bytes=20 mean_send_us=136.923 mean_usb_write_us=124.249 mean_echo_wait_us=0.434 max_usb_write_us=18247.100\n[2026-10-27T06:47:04Z INFO  gsusb_profile] frames=50000 record_bytes=20 mean_send_us=137.199 mean_usb_write_us=124.426 mean_echo_wait_us=0.435 max_usb_write_us=18247.100\n[2026-10-27T06:47:05Z INFO  gsusb_profile] frames=55000 record_bytes=20 mean_send_us=136.862 mean_usb_write_us=124.178 mean_echo_wait_us=0.435 max_usb_write_us=18247.100\n[2026-10-27T06:47:06Z INFO  gsusb_profile] frames=60000 record_bytes=20 mean_send_us=136.584 mean_usb_write_us=123.963 mean_echo_wait_us=0.434 max_usb_write_us=18247.100\n[2026-10-27T06:47:06Z INFO  gsusb_profile] frames=65000 record_bytes=20 mean_send_us=136.351 mean_usb_write_us=123.818 mean_echo_wait_us=0.433 max_usb_write_us=18247.100\n[2026-10-27T06:47:07Z INFO  gsusb_profile] frames=70000 record_bytes=20 mean_send_us=137.708 mean_usb_write_us=124.804 mean_echo_wait_us=0.433 max_usb_write_us=28879.300\n[2026-10-27T06:47:08Z INFO  gsusb_profile] frames=75000 record_bytes=20 mean_send_us=137.486 mean_usb_write_us=124.629 mean_echo_wait_us=0.432 max_usb_write_us=28879.300\n"
+  }
+}

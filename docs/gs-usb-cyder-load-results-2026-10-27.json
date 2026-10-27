@@ -1,0 +1,289 @@
+{
+  "date": "2026-10-27",
+  "logical_processors": 8,
+  "adapters": {
+    "loadA": {
+      "product": "Cyder CANable gs_usb",
+      "serial": "205233823133",
+      "backend": "WinUSB",
+      "board": "DSD TECH SH-C31A",
+      "firmware_sha256": "275fd5a50c14f7dd449c1f69be4cc6d74e7cd25ecb97a8699557dd263b1f3dad",
+      "features": "0x2503",
+      "hardware_timestamps_advertised": false
+    },
+    "loadB": {
+      "product": "canable gs_usb",
+      "serial": "002F00165046570120333836",
+      "backend": "WinUSB"
+    }
+  },
+  "builds": {
+    "canserver_sha256": "c2f0476166addfc66bb45e39b5c0d9ba67503f2dd5231bfbc2b2e419d7cfe1ad",
+    "load_example_sha256": "8712ddc68d0ef8a1d25d330bfe61c527a647281b02bade57831415b0dd66af18"
+  },
+  "notes": [
+    "Classic CAN, standard ID 0x5a0, DLC 8, little-endian sequence and inverse.",
+    "60 seconds submitting per direction, then queue drain; directions sequential.",
+    "Cyder uses 20-byte classic USB records. The factory SH-C31x 76-byte compatibility quirk remains.",
+    "Cyder does not advertise hardware timestamps; receiving through Cyder therefore yields no timestamp.",
+    "Bus usage range uses 111 to 135 bits/frame including intermission and is capped at 100%.",
+    "No CAN FD, 72-minute timestamp wrap or simultaneous bidirectional load in these tests."
+  ],
+  "runs": [
+    {
+      "label": "cyder-sustained-1M",
+      "results": [
+        {
+          "bad_payloads": 0,
+          "bitrate": 1000000,
+          "bus_load_max_percent": 100.0,
+          "bus_load_min_percent": 92.4406239200073,
+          "destination": "loadB",
+          "duplicates": 0,
+          "error_frames": 0,
+          "missing": 0,
+          "missing_sample": [],
+          "other_frames": 0,
+          "out_of_order": 0,
+          "read_error": null,
+          "receive_seconds": 60.5050384,
+          "received": 503886,
+          "received_fps": 8327.984136937595,
+          "requested_fps": 0,
+          "send_seconds": 60.0112952,
+          "source": "loadA",
+          "submitted": 503886,
+          "success": true,
+          "timestamp_regressions": 0,
+          "timestamped": 503886,
+          "write_error": null,
+          "exit_code": 0,
+          "stderr": "",
+          "measured_seconds": 61.04672280000523,
+          "devices": {
+            "loadA": "205233823133/0",
+            "loadB": "002F00165046570120333836/0"
+          },
+          "server_cpu": [
+            {
+              "name": "loadA",
+              "cpu_seconds": 38.015625,
+              "percent_one_core": 62.272998870951255,
+              "percent_machine": 7.784124858868907
+            },
+            {
+              "name": "loadB",
+              "cpu_seconds": 22.203125,
+              "percent_one_core": 36.37070751977877,
+              "percent_machine": 4.546338439972346
+            }
+          ]
+        },
+        {
+          "bad_payloads": 0,
+          "bitrate": 1000000,
+          "bus_load_max_percent": 100.0,
+          "bus_load_min_percent": 93.30102594384023,
+          "destination": "loadA",
+          "duplicates": 0,
+          "error_frames": 0,
+          "missing": 0,
+          "missing_sample": [],
+          "other_frames": 0,
+          "out_of_order": 0,
+          "read_error": null,
+          "receive_seconds": 60.5151545,
+          "received": 508661,
+          "received_fps": 8405.4978327784,
+          "requested_fps": 0,
+          "send_seconds": 60.0185524,
+          "source": "loadB",
+          "submitted": 508661,
+          "success": true,
+          "timestamp_regressions": 0,
+          "timestamped": 0,
+          "write_error": null,
+          "exit_code": 0,
+          "stderr": "",
+          "measured_seconds": 61.05302710000251,
+          "devices": {
+            "loadA": "205233823133/0",
+            "loadB": "002F00165046570120333836/0"
+          },
+          "server_cpu": [
+            {
+              "name": "loadA",
+              "cpu_seconds": 17.796875,
+              "percent_one_core": 29.149865035929185,
+              "percent_machine": 3.643733129491148
+            },
+            {
+              "name": "loadB",
+              "cpu_seconds": 30.890625,
+              "percent_one_core": 50.59638558036171,
+              "percent_machine": 6.324548197545214
+            }
+          ]
+        }
+      ],
+      "server_error_logs": {
+        "loadA": "",
+        "loadB": ""
+      }
+    },
+    {
+      "label": "cyder-sustained-125k",
+      "results": [
+        {
+          "bad_payloads": 0,
+          "bitrate": 125000,
+          "bus_load_max_percent": 100.0,
+          "bus_load_min_percent": 92.49319087525937,
+          "destination": "loadB",
+          "duplicates": 0,
+          "error_frames": 0,
+          "missing": 0,
+          "missing_sample": [],
+          "other_frames": 0,
+          "out_of_order": 0,
+          "read_error": null,
+          "receive_seconds": 64.1212001,
+          "received": 66789,
+          "received_fps": 1041.589987334002,
+          "requested_fps": 0,
+          "send_seconds": 60.0650609,
+          "source": "loadA",
+          "submitted": 66789,
+          "success": true,
+          "timestamp_regressions": 0,
+          "timestamped": 66789,
+          "write_error": null,
+          "exit_code": 0,
+          "stderr": "",
+          "measured_seconds": 64.73411489999853,
+          "devices": {
+            "loadA": "205233823133/0",
+            "loadB": "002F00165046570120333836/0"
+          },
+          "server_cpu": [
+            {
+              "name": "loadA",
+              "cpu_seconds": 6.390625,
+              "percent_one_core": 9.872113042515926,
+              "percent_machine": 1.2340141303144907
+            },
+            {
+              "name": "loadB",
+              "cpu_seconds": 3.609375,
+              "percent_one_core": 5.575692207386745,
+              "percent_machine": 0.6969615259233432
+            }
+          ]
+        },
+        {
+          "bad_payloads": 0,
+          "bitrate": 125000,
+          "bus_load_max_percent": 100.0,
+          "bus_load_min_percent": 92.18337679247648,
+          "destination": "loadA",
+          "duplicates": 0,
+          "error_frames": 0,
+          "missing": 0,
+          "missing_sample": [],
+          "other_frames": 0,
+          "out_of_order": 0,
+          "read_error": null,
+          "receive_seconds": 64.208583,
+          "received": 66656,
+          "received_fps": 1038.1010900053657,
+          "requested_fps": 0,
+          "send_seconds": 60.1435226,
+          "source": "loadB",
+          "submitted": 66656,
+          "success": true,
+          "timestamp_regressions": 0,
+          "timestamped": 0,
+          "write_error": null,
+          "exit_code": 0,
+          "stderr": "",
+          "measured_seconds": 64.8634075000009,
+          "devices": {
+            "loadA": "205233823133/0",
+            "loadB": "002F00165046570120333836/0"
+          },
+          "server_cpu": [
+            {
+              "name": "loadA",
+              "cpu_seconds": 3.734375,
+              "percent_one_core": 5.757290811463996,
+              "percent_machine": 0.7196613514329995
+            },
+            {
+              "name": "loadB",
+              "cpu_seconds": 6.796875,
+              "percent_one_core": 10.478751058522334,
+              "percent_machine": 1.3098438823152918
+            }
+          ]
+        }
+      ],
+      "server_error_logs": {
+        "loadA": "",
+        "loadB": ""
+      }
+    }
+  ],
+  "automated_tests_passed": 27,
+  "total_frames": 1145992,
+  "multiple_adapter_and_idle_check": {
+    "both_available": {
+      "exit_code": 0,
+      "stdout": "Connected gs_usb adapters:\n  1) 003:046/0  Cyder CANable gs_usb (serial 205233823133)  [Available]\n  2) 003:047/0  canable gs_usb (serial 002F00165046570120333836)  [Available]\n",
+      "stderr": ""
+    },
+    "first_started": "gs_usb connected to Cyder CANable gs_usb\n\nCreated CAN server: can0\n",
+    "first_busy_second_available": {
+      "exit_code": 0,
+      "stdout": "Connected gs_usb adapters:\n  1) 003:046/0  gs_usb adapter  [In use: 003:046/0 is in use by another server]\n  2) 003:047/0  canable gs_usb (serial 002F00165046570120333836)  [Available]\n",
+      "stderr": ""
+    },
+    "second_started": "gs_usb connected to canable gs_usb\n\nCreated CAN server: can1\n",
+    "both_busy": {
+      "exit_code": 0,
+      "stdout": "Connected gs_usb adapters:\n  1) 003:046/0  gs_usb adapter  [In use: 003:046/0 is in use by another server]\n  2) 003:047/0  gs_usb adapter  [In use: 003:047/0 is in use by another server]\n",
+      "stderr": ""
+    },
+    "duplicate_adapter": {
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "No available gs_usb adapter matched '002F00165046570120333836/0'. Use --list-adapters to inspect connected adapters.\n003:046/0: In use: 003:046/0 is in use by another server\n003:047/0: In use: 003:047/0 is in use by another server\n"
+    },
+    "duplicate_pipe": {
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "Error: Custom { kind: AddrInUse, error: \"can0 is in use by another server\" }\n"
+    },
+    "idle_cpu": [
+      {
+        "cpu_seconds": 0.0,
+        "wall_seconds": 10.00053819999448
+      },
+      {
+        "cpu_seconds": 0.0,
+        "wall_seconds": 10.00053819999448
+      }
+    ],
+    "available_after_cleanup": {
+      "exit_code": 0,
+      "stdout": "Connected gs_usb adapters:\n  1) 003:046/0  Cyder CANable gs_usb (serial 205233823133)  [Available]\n  2) 003:047/0  canable gs_usb (serial 002F00165046570120333836)  [Available]\n",
+      "stderr": ""
+    }
+  },
+  "hardware_lifecycle_check": {
+    "test": "queued_transmit_close_drop_and_reopen",
+    "cycles": 6,
+    "success": true,
+    "command": "cargo test --offline --test gsusb_hardware -- --ignored --nocapture",
+    "output": "   Compiling win_can_utils v0.2.1 (D:\\git\\win-can-utils)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.40s\n     Running tests\\gsusb_hardware.rs (target\\debug\\deps\\gsusb_hardware-e997a6a9b23868e5.exe)\n\nrunning 1 test\ntest queued_transmit_close_drop_and_reopen ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.55s\n\n"
+  }
+}

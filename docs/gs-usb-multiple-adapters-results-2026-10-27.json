@@ -1,0 +1,44 @@
+{
+  "both_available": {
+    "exit_code": 0,
+    "stdout": "Connected gs_usb adapters:\n  1) 003:014/0  SH-C31x (serial 0021002D3133500F20313355)  [Available]\n  2) 003:015/0  canable gs_usb (serial 002F00165046570120333836)  [Available]\n",
+    "stderr": ""
+  },
+  "first_started": "gs_usb connected to SH-C31x\n\nCreated CAN server: can0\n",
+  "first_busy_second_available": {
+    "exit_code": 0,
+    "stdout": "Connected gs_usb adapters:\n  1) 003:014/0  gs_usb adapter  [In use: 003:014/0 is in use by another server]\n  2) 003:015/0  canable gs_usb (serial 002F00165046570120333836)  [Available]\n",
+    "stderr": ""
+  },
+  "second_started": "gs_usb connected to canable gs_usb\n\nCreated CAN server: can1\n",
+  "both_busy": {
+    "exit_code": 0,
+    "stdout": "Connected gs_usb adapters:\n  1) 003:014/0  gs_usb adapter  [In use: 003:014/0 is in use by another server]\n  2) 003:015/0  gs_usb adapter  [In use: 003:015/0 is in use by another server]\n",
+    "stderr": ""
+  },
+  "duplicate_adapter": {
+    "exit_code": 1,
+    "stdout": "",
+    "stderr": "003:015/0: In use: 003:015/0 is in use by another server\n"
+  },
+  "duplicate_pipe": {
+    "exit_code": 1,
+    "stdout": "",
+    "stderr": "Error: Custom { kind: AddrInUse, error: \"can0 is in use by another server\" }\n"
+  },
+  "idle_cpu": [
+    {
+      "cpu_seconds": 0.0,
+      "wall_seconds": 10.000903800013475
+    },
+    {
+      "cpu_seconds": 0.0,
+      "wall_seconds": 10.000903800013475
+    }
+  ],
+  "available_after_cleanup": {
+    "exit_code": 0,
+    "stdout": "Connected gs_usb adapters:\n  1) 003:014/0  SH-C31x (serial 0021002D3133500F20313355)  [Available]\n  2) 003:015/0  canable gs_usb (serial 002F00165046570120333836)  [Available]\n",
+    "stderr": ""
+  }
+}

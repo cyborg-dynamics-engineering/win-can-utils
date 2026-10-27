@@ -1,0 +1,59 @@
+{
+  "logical_processors": 8,
+  "bitrate": 1000000,
+  "traffic": "CAN bus disconnected; no CAN frames transmitted",
+  "common_compatibility_fixes": [
+    "libusb mixed WinUSB/libusbK open/close filtering",
+    "full descriptor lengths and feature mask from BT_CONST"
+  ],
+  "builds": [
+    {
+      "label": "baseline",
+      "measurements": [
+        {
+          "reader_connected": false,
+          "wall_seconds": 30.037142300003325,
+          "cpu_seconds": 35.84375,
+          "one_core_percent": 119.33142521349653,
+          "machine_percent": 14.916428151687066
+        },
+        {
+          "reader_connected": true,
+          "wall_seconds": 30.01877379999496,
+          "cpu_seconds": 35.671875,
+          "one_core_percent": 118.83188579810009,
+          "machine_percent": 14.853985724762511
+        }
+      ],
+      "ctrl_c_delivered": true,
+      "forced_stop": true,
+      "exit_code": 1
+    },
+    {
+      "label": "modified",
+      "measurements": [
+        {
+          "reader_connected": false,
+          "wall_seconds": 30.013467099997797,
+          "cpu_seconds": 0.0,
+          "one_core_percent": 0.0,
+          "machine_percent": 0.0
+        },
+        {
+          "reader_connected": true,
+          "wall_seconds": 30.017435400004615,
+          "cpu_seconds": 0.0,
+          "one_core_percent": 0.0,
+          "machine_percent": 0.0
+        }
+      ],
+      "ctrl_c_delivered": true,
+      "forced_stop": true,
+      "exit_code": 1
+    }
+  ],
+  "date": "2026-10-27",
+  "adapter": "SH-C31A (USB product string SH-C31x)",
+  "baseline_revision": "b7850b1",
+  "lifecycle_cycles_passed": 5
+}
