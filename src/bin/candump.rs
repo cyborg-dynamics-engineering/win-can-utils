@@ -1,22 +1,20 @@
 use clap::{ArgAction, Parser};
-use crosscan::{CanInterface, can::CanFrame, win_can::WindowsCan};
+use crosscan::{
+    can::CanFrame,
+    protocol::{Command, Direction, Filter as ProtocolFilter, Reply, Subscription},
+    service::ServiceClient,
+};
 use futures::future::join_all;
 use tokio::task;
-use tokio::time::{Duration, sleep};
+use tokio::time::Duration;
 
 use std::num::ParseIntError;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-/// Minimal clap-based parser for `candump` (argument parsing only).
-///
-/// This mirrors the common candump command-line switches (parsing only)
-/// and provides a structured configuration you can hook into real
-/// candump-like behaviour later.
-///
-/// See: candump manpage for option semantics.
+/// Display traffic from one or more Windows CAN service interfaces.
 #[derive(Debug, Parser)]
-#[command(name = "candump-rs")]
-#[command(about = "candump-compatible CLI parser (args only)")]
+#[command(name = "candump")]
+#[command(about = "Display CAN traffic with per-client queues and filters")]
 pub struct Args {
     /// timestamp type: a (absolute), d (delta), z (zero), A (absolute w date)
     #[arg(short = 't', value_name = "type")]
@@ -58,8 +56,8 @@ pub struct Args {
     #[arg(short = 'L', action = ArgAction::SetTrue, hide = true)]
     pub stdout_logformat: bool,
 
-    /// terminate after reception of <count> CAN frames (Not implemented yet)
-    #[arg(short = 'n', value_name = "count", hide = true)]
+    /// Terminate after this many frames per interface
+    #[arg(short = 'n', value_name = "count")]
     pub count: Option<u64>,
 
     /// set socket receive buffer size (Not implemented yet)
@@ -70,8 +68,8 @@ pub struct Args {
     #[arg(short = 'D', action = ArgAction::SetTrue, hide = true)]
     pub dont_exit_on_down: bool,
 
-    /// monitor dropped CAN frames (Not implemented yet)
-    #[arg(short = 'd', action = ArgAction::SetTrue, hide = true)]
+    /// Report changes to server and client dropped-frame counters
+    #[arg(short = 'd', action = ArgAction::SetTrue)]
     pub monitor_drops: bool,
 
     /// dump CAN error frames in human-readable format (Not implemented yet)
@@ -89,6 +87,12 @@ pub struct Args {
     /// terminate after <msecs> if no frames were received (Not implemented yet)
     #[arg(short = 'T', value_name = "msecs", hide = true)]
     pub timeout_ms: Option<u64>,
+
+    #[arg(long, default_value_t = 1024)]
+    pub queue_capacity: usize,
+
+    #[arg(long)]
+    pub receive_own_messages: bool,
 
     /// CAN interfaces with optional filter sets: <ifname>[,filter]*
     /// multiple interfaces allowed
@@ -195,26 +199,17 @@ pub enum Filter {
     Join,
 }
 
-impl Filter {
-    /// Returns true if this filter matches the given CAN ID
-    pub fn matches(&self, can_id: u32) -> bool {
-        match *self {
-            Filter::Match { id, mask } => (can_id & mask) == (id & mask),
-            Filter::NotMatch { id, mask } => (can_id & mask) != (id & mask),
-            Filter::ErrorMask(_) => false, // error filters are not for normal CAN IDs
-            Filter::Join => true,          // Join is logical AND, doesn't filter on its own
-        }
-    }
-}
-
 pub struct CandumpInterface {
     pub ifname: String,
-    pub filters: Vec<Filter>,
-    pub pipe: WindowsCan,
+    pub pipe: ServiceClient,
 }
 
 impl CandumpInterface {
-    pub async fn parse_and_connect(spec: &str) -> Result<Self, String> {
+    pub async fn parse_and_connect(
+        spec: &str,
+        queue_capacity: usize,
+        receive_own_messages: bool,
+    ) -> Result<Self, String> {
         // format: ifname[,filter]*
         let mut parts = spec.split(',');
         let ifname = parts
@@ -263,33 +258,40 @@ impl CandumpInterface {
             return Err(format!("unrecognized filter token: '{}'", token));
         }
 
-        let pipe = connect_pipe_retry(ifname.as_str()).await;
-
-        Ok(CandumpInterface {
-            ifname,
-            filters,
-            pipe,
-        })
-    }
-
-    /// Returns true if the given CAN ID passes all filters for this interface
-    pub fn filter_check(&self, can_id: u32) -> bool {
-        let mut matched = false;
-        let mut join_mode = false;
-        for f in &self.filters {
-            match f {
-                Filter::Join => join_mode = true,
-                Filter::ErrorMask(_) => {}
-                _ => {
-                    if join_mode {
-                        matched &= f.matches(can_id);
-                    } else {
-                        matched |= f.matches(can_id);
-                    }
+        let subscription = Subscription {
+            queue_capacity,
+            receive_own_messages,
+            filters: filters
+                .iter()
+                .filter_map(|filter| match filter {
+                    Filter::Match { id, mask } => Some(ProtocolFilter {
+                        id: *id,
+                        mask: *mask,
+                        invert: false,
+                    }),
+                    Filter::NotMatch { id, mask } => Some(ProtocolFilter {
+                        id: *id,
+                        mask: *mask,
+                        invert: true,
+                    }),
+                    _ => None,
+                })
+                .collect(),
+            join_filters: filters.iter().any(|filter| matches!(filter, Filter::Join)),
+            error_mask: filters.iter().fold(0, |mask, filter| {
+                if let Filter::ErrorMask(value) = filter {
+                    mask | value
+                } else {
+                    mask
                 }
-            }
-        }
-        matched
+            }),
+            ..Default::default()
+        };
+        let pipe = ServiceClient::connect(&ifname, subscription)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(CandumpInterface { ifname, pipe })
     }
 }
 
@@ -327,7 +329,13 @@ async fn main() -> std::io::Result<()> {
     // Parse interfaces
     let mut interfaces = Vec::new();
     for spec in &args.interfaces {
-        match CandumpInterface::parse_and_connect(spec).await {
+        match CandumpInterface::parse_and_connect(
+            spec,
+            args.queue_capacity,
+            args.receive_own_messages,
+        )
+        .await
+        {
             Ok(i) => {
                 interfaces.push(i);
             }
@@ -338,47 +346,58 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    let _ = run_interfaces(interfaces, ts_mode, args.hardware_ts).await;
+    run_interfaces(
+        interfaces,
+        ts_mode,
+        args.hardware_ts,
+        args.monitor_drops,
+        args.count,
+    )
+    .await
+    .map_err(std::io::Error::other)?;
 
     Ok(())
 }
 
-async fn connect_pipe_retry(channel: &str) -> WindowsCan {
-    println!("Attempting to connect to {} server", channel);
-
-    loop {
-        match WindowsCan::open_read_only(channel) {
-            Ok(pipe) => {
-                println!("Connected to {} server", channel);
-                return pipe;
-            }
-            Err(_) => {
-                println!("Unable to connect. Is a server running for {}?", channel);
-                sleep(Duration::from_millis(500)).await;
-            }
-        };
-    }
-}
-
-// Assuming interfaces is a Vec<Interface> or similar
 async fn run_interfaces(
     interfaces: Vec<CandumpInterface>,
     ts_mode: TimestampMode,
     hardware_ts: bool,
+    monitor_drops: bool,
+    count: Option<u64>,
 ) -> anyhow::Result<()> {
     let mut handles = Vec::new();
 
     for mut interface in interfaces.into_iter() {
-        // Clone or move anything needed into the task
         let mut ts_ctx = TimestampCtx::new(ts_mode, hardware_ts);
 
         let handle = task::spawn(async move {
+            let mut timer = tokio::time::interval(Duration::from_secs(1));
+            let mut last_drops = (0, 0);
+            let mut received = 0;
+            if count == Some(0) {
+                return Ok::<(), anyhow::Error>(());
+            }
             loop {
-                match interface.pipe.read_frame().await {
-                    Ok(frame) => {
-                        if interface.filters.len() > 0 && !interface.filter_check(frame.id()) {
-                            continue;
+                let event = tokio::select! {
+                    event = interface.pipe.next_event() => event,
+                    _ = timer.tick(), if monitor_drops => {
+                        let server_drops = match interface.pipe.request(Command::Clients).await? {
+                            Reply::Clients { clients } => clients.iter().find(|c| c.client_id == interface.pipe.client_id).map_or(0, |c| c.dropped),
+                            _ => 0,
+                        };
+                        let drops = (server_drops, interface.pipe.local_drops());
+                        if drops != last_drops {
+                            eprintln!("{}: dropped {} at server, {} in client", interface.ifname, drops.0, drops.1);
+                            last_drops = drops;
                         }
+                        continue;
+                    }
+                };
+                match event {
+                    Ok(event) => {
+                        let mut frame = event.frame.to_can()?;
+                        frame.set_timestamp(event.hardware_timestamp_us);
 
                         // timestamp string
                         let ts_str = ts_ctx.get_timestamp(&frame).map_or(String::new(), |t| {
@@ -393,7 +412,7 @@ async fn run_interfaces(
                         };
 
                         println!(
-                            "{}{} {:>08}   [{}]  {}",
+                            "{}{} {:>08}   [{}]  {}{}",
                             ts_str,
                             interface.ifname,
                             id,
@@ -403,22 +422,32 @@ async fn run_interfaces(
                                 .iter()
                                 .map(|b| format!("{:02X}", b))
                                 .collect::<Vec<_>>()
-                                .join(" ")
+                                .join(" "),
+                            if event.direction == Direction::LocalTx {
+                                "  TX"
+                            } else {
+                                ""
+                            }
                         );
+                        received += 1;
+                        if count.is_some_and(|count| received >= count) {
+                            break;
+                        }
                     }
                     Err(e) => {
-                        eprintln!("Error reading from {}: {:?}", interface.ifname, e);
-                        break;
+                        return Err(e.into());
                     }
                 }
             }
+            Ok::<(), anyhow::Error>(())
         });
 
         handles.push(handle);
     }
 
-    // Wait for all tasks to finish (they won’t unless error occurs)
-    join_all(handles).await;
+    for result in join_all(handles).await {
+        result??;
+    }
 
     Ok(())
 }

@@ -1149,6 +1149,52 @@ impl GsUsbDriver {
 
 #[async_trait]
 impl CanDriver for GsUsbDriver {
+    fn capabilities(&self) -> crosscan::protocol::Capabilities {
+        crosscan::protocol::Capabilities {
+            hardware_can_fd: Some(self.features & GS_CAN_FEATURE_FD != 0),
+            can_fd: false,
+            hardware_timestamps: Some(self.features & GS_CAN_FEATURE_HW_TIMESTAMP != 0),
+            bus_state: self.features & GS_CAN_FEATURE_GET_STATE != 0,
+            software_tx_echo: true,
+        }
+    }
+
+    async fn health(&mut self) -> io::Result<crate::drivers::can_driver::DriverHealth> {
+        use crate::drivers::can_driver::DriverHealth;
+        use crosscan::protocol::BusState;
+        self.tx_slots.check()?;
+        if self.features & GS_CAN_FEATURE_GET_STATE == 0 {
+            return Ok(DriverHealth::default());
+        }
+        let bytes = self
+            .cmd_control_in(
+                request_type_in(),
+                _GS_USB_BREQ_GET_STATE,
+                self.channel_index as u16,
+                self.interface as u16,
+                12,
+            )
+            .await?;
+        if bytes.len() != 12 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Short gs_usb GET_STATE response",
+            ));
+        }
+        Ok(DriverHealth {
+            bus_state: match u32::from_le_bytes(bytes[..4].try_into().unwrap()) {
+                0 => BusState::ErrorActive,
+                1 => BusState::ErrorWarning,
+                2 => BusState::ErrorPassive,
+                3 => BusState::BusOff,
+                4 => BusState::Stopped,
+                _ => BusState::Unknown,
+            },
+            rx_error_counter: Some(u32::from_le_bytes(bytes[4..8].try_into().unwrap())),
+            tx_error_counter: Some(u32::from_le_bytes(bytes[8..12].try_into().unwrap())),
+        })
+    }
+
     fn receive_notifier(&self) -> Option<Arc<Notify>> {
         Some(self.rx_ready.clone())
     }

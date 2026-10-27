@@ -1,11 +1,28 @@
 use async_trait::async_trait;
 use crosscan::can::CanFrame;
+use crosscan::protocol::{BusState, Capabilities};
 use std::io;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
+#[derive(Clone, Debug, Default)]
+pub struct DriverHealth {
+    pub bus_state: BusState,
+    pub rx_error_counter: Option<u32>,
+    pub tx_error_counter: Option<u32>,
+}
+
 #[async_trait]
 pub trait CanDriver: Send + Sync {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
+    }
+
+    /// Unknown fields remain unknown; querying must not reconfigure the device.
+    async fn health(&mut self) -> io::Result<DriverHealth> {
+        Ok(DriverHealth::default())
+    }
+
     async fn enable_timestamp(&mut self) -> std::io::Result<()>;
 
     async fn set_bitrate(&mut self, bitrate: u32) -> io::Result<()>;

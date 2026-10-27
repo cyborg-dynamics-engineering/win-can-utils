@@ -52,7 +52,37 @@ Other adapters do not require this dependency.
 ## Usage
 
 ### CAN Server
-Opens a CAN connection to a USB-to-CAN adapter and exposes it via a Windows [pipe](https://learn.microsoft.com/en-us/windows/win32/ipc/pipes).  
+Runs a named, multi-client CAN interface broker over local Windows pipes. Each
+subscriber has independent filters, a bounded receive queue, and drop counters.
+Settings and desired up/down state are saved between runs. The broker remains
+available for configuration and status when hardware is down or disconnected.
+
+```powershell
+canctl can0 create --driver gsusb --device SERIAL/0 --bitrate 500000
+canserver --name can0
+# From another terminal:
+canctl can0 up
+candump -d can0
+cansend can0 123#010203
+canctl can0 show
+canctl can0 clients
+canctl can0 down
+canctl can0 set --bitrate 250000
+canctl can0 up
+```
+
+Configurations default to `%LOCALAPPDATA%\win-can-utils\interfaces\NAME.json`.
+Use `--config PATH` for another location. `canserver virtual --name vcan0`
+provides a hardware-free interface. Keep `canserver` running while clients use
+it; this does not install a Windows service or create an NDIS network adapter.
+
+The versioned duplex client is exposed through
+`crosscan::service::ServiceClient`; legacy `WindowsCan` clients remain supported.
+See the [v1 protocol and lifecycle guide](docs/client-protocol-v1.md) for wire
+format, client APIs, timestamps, capabilities, and echo semantics, and the
+[Python client example](examples/service_client.py) for another language.
+
+The original creation syntax is also supported and saves the configuration.
 The interface can be auto-detected or specified manually. **Bitrate usually must be specified** unless supported auto-detect exists.
 
 ```
@@ -93,10 +123,10 @@ outside the driver lock, leaving transmit and control commands available. It doe
 not add a sleep between CAN frames. Completed reads are parsed in submission order
 to preserve frame fragments and hardware timestamps.
 
-The bounded IPC queue applies backpressure instead of silently discarding frames
-when it fills. A connected reader must still keep up with sustained bus traffic:
-the host and adapter buffers are finite, so an absent or persistently slow reader
-can eventually cause adapter overflow.
+Each subscriber's bounded IPC queue drops new frames for that subscriber when
+full, without blocking hardware reception or other clients. Inspect counters
+with `canctl NAME clients` or `candump -d NAME`. Hardware and USB buffers remain
+finite; server queue drops and client-side drops are reported separately.
 
 Transmits queue up to ten asynchronous USB writes in submission order. A credit
 returns only after both USB completion and its firmware echo. `send_frame`
@@ -111,10 +141,15 @@ Hardware measurements and a reproducible load test are documented in
 [gs_usb validation](docs/gs-usb-validation.md).
 
 ### CAN Dump
-Displays real-time CAN traffic from an open CAN pipe. 
+Displays real-time traffic using a dedicated subscription. Multiple `candump`
+instances can observe the same interface, with separate filters and queues.
 ```
 Usage: candump <port>
 Example: candump can0
+```
+
+```powershell
+candump -d --queue-capacity 4096 "can0,123:800007FF"
 ```
 ⚠️ Requires an active CAN server instance for the target port.
 
@@ -124,6 +159,12 @@ Sends the given CAN frame to an open CAN pipe.
 Usage: cansend <port> <ID#DATA>
 Example: cansend COM5 055#00
 ```
+
+Successful sends are echoed to other matching subscribers at backend admission.
+`cansend can0 123#01 --receive-own-messages` also receives and prints the sender's
+own echo. Echo is not proof of a CAN acknowledgement. Standard, extended and RTR
+classic frames are supported; end-to-end CAN FD remains unavailable even when
+the adapter advertises FD hardware capability.
 ⚠️ Requires an active CAN server instance for the target port.
 
 ## Canable Firmware Installation

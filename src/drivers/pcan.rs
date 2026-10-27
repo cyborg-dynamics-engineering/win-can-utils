@@ -12,12 +12,14 @@ type CanInitializeFn = unsafe extern "system" fn(WORD, WORD, BYTE, DWORD, WORD) 
 type CanUninitializeFn = unsafe extern "system" fn(WORD) -> DWORD;
 type CanWriteFn = unsafe extern "system" fn(WORD, *mut CANTPMsg) -> DWORD;
 type CanReadFn = unsafe extern "system" fn(WORD, *mut CANTPMsg, *mut CANTPTimestamp) -> DWORD;
+type CanGetStatusFn = unsafe extern "system" fn(WORD) -> DWORD;
 
 struct PcanApi {
     can_initialize: CanInitializeFn,
     can_uninitialize: CanUninitializeFn,
     can_write: CanWriteFn,
     can_read: CanReadFn,
+    can_get_status: CanGetStatusFn,
 }
 
 static PCAN_API: OnceLock<Result<PcanApi, String>> = OnceLock::new();
@@ -39,6 +41,9 @@ fn load_pcan_api() -> Result<PcanApi, String> {
         let can_read = *lib
             .get::<CanReadFn>(b"CAN_Read\0")
             .map_err(|e| format!("Failed to load CAN_Read: {e}"))?;
+        let can_get_status = *lib
+            .get::<CanGetStatusFn>(b"CAN_GetStatus\0")
+            .map_err(|e| format!("Failed to load CAN_GetStatus: {e}"))?;
 
         // Leak the library handle so the loaded symbols remain valid for the
         // remainder of the process. This avoids lifetime issues with the
@@ -51,6 +56,7 @@ fn load_pcan_api() -> Result<PcanApi, String> {
             can_uninitialize,
             can_write,
             can_read,
+            can_get_status,
         })
     }
 }
@@ -69,6 +75,7 @@ fn pcan_api() -> std::io::Result<&'static PcanApi> {
 pub struct PcanDriver {
     channel: WORD,
     configured_bitrate: Option<u32>,
+    is_open: bool,
     // PCAN calls are synchronous; keep a mutex to serialize access like the SLCAN driver does.
     io_lock: Mutex<()>,
 }
@@ -85,6 +92,7 @@ impl PcanDriver {
         Ok(Self {
             channel,
             configured_bitrate: None,
+            is_open: false,
             io_lock: Mutex::new(()),
         })
     }
@@ -141,8 +149,74 @@ fn map_bitrate_to_const(bps: u32) -> Option<WORD> {
     } as WORD)
 }
 
+fn status_error(operation: &str, status: u32) -> std::io::Error {
+    use std::io::ErrorKind;
+    let transient = PEAK_ERROR_ANYBUSERR
+        | PEAK_ERROR_XMTFULL
+        | PEAK_ERROR_QXMTFULL
+        | PEAK_ERROR_OVERRUN
+        | PEAK_ERROR_QOVERRUN;
+    let kind = if status & !transient == 0 {
+        ErrorKind::WouldBlock
+    } else if matches!(
+        status,
+        PEAK_ERROR_ILLHW
+            | PEAK_ERROR_ILLNET
+            | PEAK_ERROR_ILLCLIENT
+            | PEAK_ERROR_NODRIVER
+            | PEAK_ERROR_INITIALIZE
+    ) {
+        ErrorKind::NotConnected
+    } else if status & (PEAK_ERROR_ILLPARAMVAL | PEAK_ERROR_ILLDATA) != 0 {
+        ErrorKind::InvalidInput
+    } else {
+        ErrorKind::Other
+    };
+    std::io::Error::new(kind, format!("{operation} failed: 0x{status:08X}"))
+}
+
 #[async_trait]
 impl CanDriver for PcanDriver {
+    fn capabilities(&self) -> crosscan::protocol::Capabilities {
+        crosscan::protocol::Capabilities {
+            hardware_can_fd: None,
+            can_fd: false,
+            hardware_timestamps: Some(true),
+            bus_state: true,
+            software_tx_echo: true,
+        }
+    }
+
+    async fn health(&mut self) -> std::io::Result<crate::drivers::can_driver::DriverHealth> {
+        use crosscan::protocol::BusState;
+        let status = unsafe { (pcan_api()?.can_get_status)(self.channel) };
+        let known = PEAK_ERROR_BUSOFF
+            | PEAK_ERROR_BUSPASSIVE
+            | PEAK_ERROR_BUSHEAVY
+            | PEAK_ERROR_BUSLIGHT
+            | PEAK_ERROR_QOVERRUN
+            | PEAK_ERROR_OVERRUN
+            | PEAK_ERROR_QXMTFULL
+            | PEAK_ERROR_XMTFULL;
+        if status & !known != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                format!("CAN_GetStatus failed: 0x{status:08X}"),
+            ));
+        }
+        Ok(crate::drivers::can_driver::DriverHealth {
+            bus_state: if status & PEAK_ERROR_BUSOFF != 0 {
+                BusState::BusOff
+            } else if status & PEAK_ERROR_BUSPASSIVE != 0 {
+                BusState::ErrorPassive
+            } else if status & (PEAK_ERROR_BUSHEAVY | PEAK_ERROR_BUSLIGHT) != 0 {
+                BusState::ErrorWarning
+            } else {
+                BusState::ErrorActive
+            },
+            ..Default::default()
+        })
+    }
     async fn enable_timestamp(&mut self) -> std::io::Result<()> {
         // PCAN-Basic always provides timestamps via CAN_Read’s third parameter; no switch needed.
         Ok(())
@@ -178,6 +252,7 @@ impl CanDriver for PcanDriver {
                 format!("CAN_Initialize failed: 0x{:08X}", status),
             ));
         }
+        self.is_open = true;
         Ok(())
     }
 
@@ -196,6 +271,9 @@ impl CanDriver for PcanDriver {
             LEN: frame.dlc() as u8,
             DATA: [0u8; 8],
         };
+        if frame.is_rtr() {
+            msg.MSGTYPE |= PEAK_MESSAGE_RTR as u8;
+        }
         let data = frame.data();
         let copy_len = data.len().min(8);
         msg.DATA[..copy_len].copy_from_slice(&data[..copy_len]);
@@ -203,10 +281,7 @@ impl CanDriver for PcanDriver {
         let mut msg_alias: CANTPMsg = msg; // function takes alias pointer
         let status = unsafe { (api.can_write)(self.channel, &mut msg_alias as *mut CANTPMsg) };
         if status != PEAK_ERROR_OK {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("CAN_Write failed: 0x{:08X}", status),
-            ));
+            return Err(status_error("CAN_Write", status));
         }
         Ok(())
     }
@@ -216,7 +291,7 @@ impl CanDriver for PcanDriver {
         let api = pcan_api()?;
         let mut frames = Vec::new();
 
-        loop {
+        for _ in 0..1024 {
             // Prepare output buffers for CAN_Read
             let mut msg: CANTPMsg = tagCANTPMsg {
                 ID: 0,
@@ -241,10 +316,24 @@ impl CanDriver for PcanDriver {
                 break; // no more frames in RX queue
             }
             if status != PEAK_ERROR_OK {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("CAN_Read failed: 0x{:08X}", status),
-                ));
+                // Bus state and overruns are reported by health(), not transport loss.
+                if status
+                    & !(PEAK_ERROR_BUSOFF
+                        | PEAK_ERROR_BUSPASSIVE
+                        | PEAK_ERROR_BUSHEAVY
+                        | PEAK_ERROR_BUSLIGHT
+                        | PEAK_ERROR_QOVERRUN
+                        | PEAK_ERROR_OVERRUN
+                        | PEAK_ERROR_QRCVEMPTY)
+                    == 0
+                {
+                    break;
+                }
+                return Err(status_error("CAN_Read", status));
+            }
+
+            if msg.MSGTYPE & PEAK_MESSAGE_STATUS as u8 != 0 {
+                continue;
             }
 
             // Extended frame?
@@ -253,7 +342,10 @@ impl CanDriver for PcanDriver {
             let dlc = (msg.LEN as usize).min(8);
             let data = &msg.DATA[..dlc];
 
-            let mut frame = if extended {
+            let mut frame = if msg.MSGTYPE & PEAK_MESSAGE_RTR as u8 != 0 {
+                CanFrame::new_remote(msg.ID, dlc, extended)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+            } else if extended {
                 CanFrame::new_eff(msg.ID, data)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
             } else {
@@ -273,6 +365,9 @@ impl CanDriver for PcanDriver {
     }
 
     async fn close_channel(&mut self) -> std::io::Result<()> {
+        if !self.is_open {
+            return Ok(());
+        }
         let _g = self.io_lock.lock().await;
         let api = pcan_api()?;
         let status = unsafe { (api.can_uninitialize)(self.channel) };
@@ -282,10 +377,23 @@ impl CanDriver for PcanDriver {
                 format!("CAN_Uninitialize failed: 0x{:08X}", status),
             ));
         }
+        self.is_open = false;
         Ok(())
     }
 
     async fn get_bitrate(&self) -> Option<u32> {
         self.configured_bitrate
+    }
+}
+
+impl Drop for PcanDriver {
+    fn drop(&mut self) {
+        if self.is_open {
+            if let Ok(api) = pcan_api() {
+                unsafe {
+                    (api.can_uninitialize)(self.channel);
+                }
+            }
+        }
     }
 }
