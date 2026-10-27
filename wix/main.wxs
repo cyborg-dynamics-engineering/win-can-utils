@@ -152,6 +152,10 @@
                                 Source='$(var.CargoTargetBinDir)\canctl.exe'
                                 KeyPath='yes'/>
                         </Component>
+                        <Component Id='binary4' Guid='*'>
+                            <File Id='exe4' Name='canadapter.exe' DiskId='1'
+                                Source='$(var.CargoTargetBinDir)\canadapter.exe' KeyPath='yes'/>
+                        </Component>
                     </Directory>
                 </Directory>
             </Directory>
@@ -177,6 +181,7 @@
             <ComponentRef Id='binary1'/>
             <ComponentRef Id='binary2'/>
             <ComponentRef Id='binary3'/>
+            <ComponentRef Id='binary4'/>
 
             <Feature
                 Id='Environment'

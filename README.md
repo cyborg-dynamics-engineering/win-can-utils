@@ -16,6 +16,7 @@ Currently supported adapters include:
     - [CAN Server](#can-server)
     - [CAN Dump](#can-dump)
     - [CAN Send](#can-send)
+    - [Windows Network Adapter (Experimental)](#windows-network-adapter-experimental)
   - [Canable Firmware Installation](#canable-firmware-installation)
   - [Installing WinUSB Driver for Canable Devices](#installing-winusb-driver-for-canable-devices)
   - [License](#license)
@@ -166,6 +167,22 @@ own echo. Echo is not proof of a CAN acknowledgement. Standard, extended and RTR
 classic frames are supported; end-to-end CAN FD remains unavailable even when
 the adapter advertises FD hardware capability.
 ⚠️ Requires an active CAN server instance for the target port.
+
+### Windows Network Adapter (Experimental)
+
+`canadapter` bridges a dedicated Wintun NDIS network adapter to a CAN service
+interface. Applications use normal UDP sockets and the v1 JSON protocol through
+that adapter. Read-only diagnostics work without elevation:
+
+```powershell
+canadapter probe --dll "C:\path\to\wintun.dll"
+```
+
+Adapter creation and IP setup require an elevated run. The prototype's packet,
+broker, ordinary UDP, and native API tests run without installing a driver.
+Live adapter creation/configuration is pending validation. See the
+[Windows network adapter guide](docs/windows-network-adapter.md) for the
+architecture, test results, setup commands, and Python UDP example.
 
 ## Canable Firmware Installation
 
