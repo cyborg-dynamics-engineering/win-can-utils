@@ -65,6 +65,51 @@ Supported drivers:
 - `slcan` → Serial-line CAN adapters  
 - `pcan` → PEAK PCAN-USB/PCI/LAN adapters (requires [PCAN-Basic Dependency](#pcan-basic-dependency))  
 
+For gs_usb, `canserver gsusb --list-adapters` lists connected adapters, including
+ones that are busy, inaccessible, or have an unsupported USB driver. Starting
+with `canserver gsusb --bitrate 1000000` opens the sole available adapter when
+only one is connected. When several are connected, it displays the list and
+prompts for an available adapter. Scripts must select explicitly with `--device`.
+
+Run a separate server for each adapter, with independent IPC names:
+
+```powershell
+canserver gsusb --list-adapters
+canserver gsusb --device 003:014/0 --name can0 --bitrate 1000000
+# In another terminal:
+canserver gsusb --device 003:015/0 --name can1 --bitrate 1000000
+```
+
+Use the IDs from your own list; USB addresses can change after reconnection.
+`--device` also accepts a serial number or product name (optionally `/interface`).
+When `--name` is omitted, servers reserve the next free `canN` atomically.
+Another server cannot claim the same adapter interface or IPC name. Each selected
+USB interface must expose gs_usb bulk endpoints; a DFU interface is not a CAN
+interface. Legacy `--channel` selectors remain supported.
+
+The gs_usb receive path keeps 64 asynchronous USB reads queued. USB completion
+wakes the receiver immediately; an idle `canserver` waits for a frame notification
+outside the driver lock, leaving transmit and control commands available. It does
+not add a sleep between CAN frames. Completed reads are parsed in submission order
+to preserve frame fragments and hardware timestamps.
+
+The bounded IPC queue applies backpressure instead of silently discarding frames
+when it fills. A connected reader must still keep up with sustained bus traffic:
+the host and adapter buffers are finite, so an absent or persistently slow reader
+can eventually cause adapter overflow.
+
+Transmits queue up to ten asynchronous USB writes in submission order. A credit
+returns only after both USB completion and its firmware echo. `send_frame`
+acknowledges queue admission; later USB failures stop the worker and surface
+through receive or subsequent send operations. CAN mode changes drain earlier
+USB writes, and dropping a driver cancels and retires its pending transfers.
+FD-capable adapters use compact receive records for classic CAN. Classic transmit
+records use 20 bytes, with a 76-byte compatibility quirk for the tested factory
+SH-C31x firmware. The Windows USB backend is patched locally to claim only the selected
+interface; see [the vendor notes](vendor/libusb1-sys/LOCAL_CHANGES.md).
+Hardware measurements and a reproducible load test are documented in
+[gs_usb validation](docs/gs-usb-validation.md).
+
 ### CAN Dump
 Displays real-time CAN traffic from an open CAN pipe. 
 ```
@@ -142,6 +187,9 @@ Windows CAN Utils is dual-licensed under:
 - [MIT License](http://opensource.org/licenses/MIT)  
 
 You may choose either license.
+
+Vendored dependencies retain their own licenses. In particular, the bundled
+libusb source is covered by [LGPL 2.1](vendor/libusb1-sys/libusb/COPYING).
 
 ## Developers
 

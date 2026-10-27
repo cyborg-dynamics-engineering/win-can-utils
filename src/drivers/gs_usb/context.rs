@@ -1,27 +1,32 @@
 #![allow(dead_code)]
 
 use std::ffi::CStr;
+use std::future::Future;
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::raw::{c_int, c_uint, c_void};
+use std::pin::Pin;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use libusb1_sys as libusb;
 use libusb1_sys::constants::{
-    LIBUSB_CONTROL_SETUP_SIZE, LIBUSB_ERROR_INTERRUPTED, LIBUSB_ERROR_NO_DEVICE,
-    LIBUSB_ERROR_NOT_FOUND, LIBUSB_ERROR_NOT_SUPPORTED, LIBUSB_ERROR_PIPE, LIBUSB_ERROR_TIMEOUT,
-    LIBUSB_TRANSFER_CANCELLED, LIBUSB_TRANSFER_COMPLETED, LIBUSB_TRANSFER_ERROR,
-    LIBUSB_TRANSFER_NO_DEVICE, LIBUSB_TRANSFER_OVERFLOW, LIBUSB_TRANSFER_STALL,
-    LIBUSB_TRANSFER_TIMED_OUT, LIBUSB_TRANSFER_TYPE_BULK, LIBUSB_TRANSFER_TYPE_CONTROL,
+    LIBUSB_CONTROL_SETUP_SIZE, LIBUSB_ERROR_ACCESS, LIBUSB_ERROR_BUSY, LIBUSB_ERROR_INTERRUPTED,
+    LIBUSB_ERROR_NO_DEVICE, LIBUSB_ERROR_NOT_FOUND, LIBUSB_ERROR_NOT_SUPPORTED, LIBUSB_ERROR_PIPE,
+    LIBUSB_ERROR_TIMEOUT, LIBUSB_TRANSFER_CANCELLED, LIBUSB_TRANSFER_COMPLETED,
+    LIBUSB_TRANSFER_ERROR, LIBUSB_TRANSFER_NO_DEVICE, LIBUSB_TRANSFER_OVERFLOW,
+    LIBUSB_TRANSFER_STALL, LIBUSB_TRANSFER_TIMED_OUT, LIBUSB_TRANSFER_TYPE_BULK,
+    LIBUSB_TRANSFER_TYPE_CONTROL,
 };
 use log::{debug, error, warn};
 use tokio::sync::oneshot;
 
 use super::constants::duration_to_timeout;
+use crate::instance_lock::InstanceLock;
 
 #[derive(Copy, Clone)]
 pub(crate) struct LibusbCtxPtr(pub(crate) *mut libusb::libusb_context);
@@ -52,20 +57,20 @@ impl LibusbContext {
         let running_thread = running.clone();
         let ctx_for_thread = ctx_ptr.clone();
 
-        // Spawn a small helper thread polling libusb for asynchronous transfer completion.
+        // libusb blocks on OS events and wakes immediately on USB completion.
+        // A long maximum wait does not add receive latency.
         let handle = std::thread::Builder::new()
             .name("libusb-events".into())
             .spawn(move || {
-                // 10ms poll keeps latency low and prevents stalling async callbacks.
-                let mut timeval = libc::timeval {
-                    tv_sec: 0,
-                    tv_usec: 10_000,
-                };
                 while running_thread.load(Ordering::SeqCst) {
+                    let timeval = libc::timeval {
+                        tv_sec: 1,
+                        tv_usec: 0,
+                    };
                     let rc = unsafe {
                         libusb::libusb_handle_events_timeout_completed(
                             ctx_for_thread.0,
-                            &mut timeval,
+                            &timeval,
                             ptr::null_mut(),
                         )
                     };
@@ -73,11 +78,13 @@ impl LibusbContext {
                         continue;
                     }
                     if rc < 0 && running_thread.load(Ordering::SeqCst) {
-                        std::thread::yield_now();
+                        error!("libusb event handling failed: {}", libusb_error_string(rc));
+                        std::thread::sleep(Duration::from_millis(10));
                     }
                 }
             })
             .map_err(|e| {
+                unsafe { libusb::libusb_exit(ctx) };
                 io::Error::new(
                     io::ErrorKind::Other,
                     format!("Failed to spawn libusb event thread: {e}"),
@@ -97,15 +104,7 @@ impl Drop for LibusbContext {
         self.running.store(false, Ordering::SeqCst);
 
         unsafe {
-            let mut zero = libc::timeval {
-                tv_sec: 0,
-                tv_usec: 0,
-            };
-            let _ = libusb::libusb_handle_events_timeout_completed(
-                self.ptr.0,
-                &mut zero,
-                ptr::null_mut(),
-            );
+            libusb::libusb_interrupt_event_handler(self.ptr.0);
         }
 
         if let Ok(mut guard) = self.thread.lock() {
@@ -121,18 +120,28 @@ impl Drop for LibusbContext {
 /// Wrapper around a libusb device handle, adding async helpers and automatic close semantics.
 #[derive(Clone)]
 pub(crate) struct LibusbDeviceHandle {
-    pub(crate) _context: Arc<LibusbContext>,
+    // Fields drop in declaration order: close the handle before its context.
     handle: Arc<LibusbHandleWrapper>,
+    pub(crate) _context: Arc<LibusbContext>,
 }
 
-struct LibusbHandleWrapper(*mut libusb::libusb_device_handle);
+struct LibusbHandleWrapper {
+    ptr: *mut libusb::libusb_device_handle,
+    claimed: Mutex<Vec<i32>>,
+    _ownership: InstanceLock,
+}
 
 unsafe impl Send for LibusbHandleWrapper {}
 unsafe impl Sync for LibusbHandleWrapper {}
 
 impl Drop for LibusbHandleWrapper {
     fn drop(&mut self) {
-        unsafe { libusb::libusb_close(self.0) };
+        unsafe {
+            for interface in self.claimed.get_mut().unwrap().drain(..) {
+                libusb::libusb_release_interface(self.ptr, interface);
+            }
+            libusb::libusb_close(self.ptr);
+        }
     }
 }
 
@@ -140,6 +149,7 @@ impl LibusbDeviceHandle {
     pub(crate) fn open(
         context: Arc<LibusbContext>,
         device: *mut libusb::libusb_device,
+        ownership: InstanceLock,
     ) -> io::Result<Self> {
         let mut handle = ptr::null_mut();
         let rc = unsafe { libusb::libusb_open(device, &mut handle) };
@@ -148,17 +158,21 @@ impl LibusbDeviceHandle {
         }
         Ok(Self {
             _context: context,
-            handle: Arc::new(LibusbHandleWrapper(handle)),
+            handle: Arc::new(LibusbHandleWrapper {
+                ptr: handle,
+                claimed: Mutex::new(Vec::new()),
+                _ownership: ownership,
+            }),
         })
     }
 
     pub(crate) fn raw(&self) -> *mut libusb::libusb_device_handle {
-        self.handle.0
+        self.handle.ptr
     }
 
     pub(crate) fn set_auto_detach_kernel_driver(&self, enable: bool) -> io::Result<()> {
         let flag = if enable { 1 } else { 0 };
-        let rc = unsafe { libusb::libusb_set_auto_detach_kernel_driver(self.handle.0, flag) };
+        let rc = unsafe { libusb::libusb_set_auto_detach_kernel_driver(self.handle.ptr, flag) };
         if rc < 0 && rc != LIBUSB_ERROR_NOT_SUPPORTED {
             return Err(map_libusb_error(rc));
         }
@@ -166,32 +180,42 @@ impl LibusbDeviceHandle {
     }
 
     pub(crate) fn claim_interface(&self, interface: i32) -> io::Result<()> {
-        let rc = unsafe { libusb::libusb_claim_interface(self.handle.0, interface) };
+        let mut claimed = self.handle.claimed.lock().unwrap();
+        if claimed.contains(&interface) {
+            return Ok(());
+        }
+        let rc = unsafe { libusb::libusb_claim_interface(self.handle.ptr, interface) };
         if rc < 0 {
             return Err(map_libusb_error(rc));
         }
+        claimed.push(interface);
         Ok(())
     }
 
     pub(crate) fn clear_halt(&self, endpoint: u8) -> io::Result<()> {
-        let rc = unsafe { libusb::libusb_clear_halt(self.handle.0, endpoint) };
+        let rc = unsafe { libusb::libusb_clear_halt(self.handle.ptr, endpoint) };
         if rc < 0 {
             return Err(map_libusb_error(rc));
         }
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub(crate) async fn bulk_write(
+    /// Submit immediately; the returned future owns cancellation and buffer lifetime.
+    pub(crate) fn submit_bulk_write(
         &self,
         endpoint: u8,
         data: Vec<u8>,
         timeout: Duration,
-    ) -> io::Result<usize> {
+    ) -> io::Result<PendingBulkWrite> {
         let (sender, receiver) = oneshot::channel();
+        let completion = Arc::new(TransferCompletion {
+            transfer: Mutex::new(ptr::null_mut()),
+            finished: Condvar::new(),
+        });
         let state = Box::new(BulkWriteState {
             sender: Some(sender),
             buffer: Some(data),
+            completion: completion.clone(),
         });
         let state_ptr = Box::into_raw(state);
         let transfer = unsafe { libusb::libusb_alloc_transfer(0) };
@@ -205,7 +229,7 @@ impl LibusbDeviceHandle {
             ));
         }
         unsafe {
-            (*transfer).dev_handle = self.handle.0;
+            (*transfer).dev_handle = self.handle.ptr;
             (*transfer).endpoint = endpoint;
             (*transfer).transfer_type = LIBUSB_TRANSFER_TYPE_BULK;
             (*transfer).timeout = duration_to_timeout(timeout);
@@ -216,6 +240,7 @@ impl LibusbDeviceHandle {
                 (*transfer).length = buffer.len() as c_int;
             }
         }
+        *completion.transfer.lock().unwrap() = transfer;
         let submit = unsafe { libusb::libusb_submit_transfer(transfer) };
         if submit < 0 {
             unsafe {
@@ -224,13 +249,11 @@ impl LibusbDeviceHandle {
             }
             return Err(map_libusb_error(submit));
         }
-        match receiver.await {
-            Ok(result) => result,
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Bulk write transfer channel closed",
-            )),
-        }
+        Ok(PendingTransfer {
+            receiver,
+            completion,
+            _handle: self.clone(),
+        })
     }
 
     #[allow(dead_code)]
@@ -247,7 +270,7 @@ impl LibusbDeviceHandle {
         // Safe: libusb takes mutable pointer + len
         let res = unsafe {
             libusb1_sys::libusb_control_transfer(
-                self.handle.0,
+                self.handle.ptr,
                 request_type,
                 request,
                 value,
@@ -267,16 +290,22 @@ impl LibusbDeviceHandle {
         }
     }
 
-    pub(crate) async fn bulk_read(
+    /// Submit immediately, keeping the device alive until completion or cancellation.
+    pub(crate) fn submit_bulk_read(
         &self,
         endpoint: u8,
         length: usize,
         timeout: Duration,
-    ) -> io::Result<Vec<u8>> {
+    ) -> io::Result<PendingBulkRead> {
         let (sender, receiver) = oneshot::channel();
+        let completion = Arc::new(TransferCompletion {
+            transfer: Mutex::new(ptr::null_mut()),
+            finished: Condvar::new(),
+        });
         let state = Box::new(BulkReadState {
             sender: Some(sender),
             buffer: Some(vec![0u8; length]),
+            completion: completion.clone(),
         });
         let state_ptr = Box::into_raw(state);
         let transfer = unsafe { libusb::libusb_alloc_transfer(0) };
@@ -290,7 +319,7 @@ impl LibusbDeviceHandle {
             ));
         }
         unsafe {
-            (*transfer).dev_handle = self.handle.0;
+            (*transfer).dev_handle = self.handle.ptr;
             (*transfer).endpoint = endpoint;
             (*transfer).transfer_type = LIBUSB_TRANSFER_TYPE_BULK;
             (*transfer).timeout = duration_to_timeout(timeout);
@@ -301,6 +330,7 @@ impl LibusbDeviceHandle {
                 (*transfer).length = buffer.len() as c_int;
             }
         }
+        *completion.transfer.lock().unwrap() = transfer;
         let submit = unsafe { libusb::libusb_submit_transfer(transfer) };
         if submit < 0 {
             unsafe {
@@ -309,13 +339,11 @@ impl LibusbDeviceHandle {
             }
             return Err(map_libusb_error(submit));
         }
-        match receiver.await {
-            Ok(result) => result,
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Bulk read transfer channel closed",
-            )),
-        }
+        Ok(PendingTransfer {
+            receiver,
+            completion,
+            _handle: self.clone(),
+        })
     }
 
     #[allow(dead_code)]
@@ -357,7 +385,7 @@ impl LibusbDeviceHandle {
             ));
         }
         unsafe {
-            (*transfer).dev_handle = self.handle.0;
+            (*transfer).dev_handle = self.handle.ptr;
             (*transfer).endpoint = 0;
             (*transfer).transfer_type = LIBUSB_TRANSFER_TYPE_CONTROL;
             (*transfer).timeout = duration_to_timeout(timeout);
@@ -396,7 +424,7 @@ impl LibusbDeviceHandle {
         let mut transferred: c_int = 0;
         let rc = unsafe {
             libusb::libusb_bulk_transfer(
-                self.handle.0,
+                self.handle.ptr,
                 endpoint,
                 buffer.as_mut_ptr(),
                 length as c_int,
@@ -421,7 +449,7 @@ impl LibusbDeviceHandle {
         let mut transferred: c_int = 0;
         let rc = unsafe {
             libusb::libusb_bulk_transfer(
-                self.handle.0,
+                self.handle.ptr,
                 endpoint,
                 data.as_ptr() as *mut u8,
                 data.len() as c_int,
@@ -447,7 +475,7 @@ impl LibusbDeviceHandle {
         let millis = duration_to_timeout(timeout) as u32;
         let rc = unsafe {
             libusb::libusb_control_transfer(
-                self.handle.0,
+                self.handle.ptr,
                 request_type,
                 request,
                 value,
@@ -475,7 +503,7 @@ impl LibusbDeviceHandle {
         let millis = duration_to_timeout(timeout) as u32;
         let rc = unsafe {
             libusb::libusb_control_transfer(
-                self.handle.0,
+                self.handle.ptr,
                 request_type,
                 request,
                 value,
@@ -495,11 +523,55 @@ impl LibusbDeviceHandle {
 struct BulkWriteState {
     sender: Option<oneshot::Sender<io::Result<usize>>>,
     buffer: Option<Vec<u8>>,
+    completion: Arc<TransferCompletion>,
 }
 
 struct BulkReadState {
     sender: Option<oneshot::Sender<io::Result<Vec<u8>>>>,
     buffer: Option<Vec<u8>>,
+    completion: Arc<TransferCompletion>,
+}
+
+struct TransferCompletion {
+    transfer: Mutex<*mut libusb::libusb_transfer>,
+    finished: Condvar,
+}
+
+// The pointer is only inspected, cancelled, or cleared while holding the mutex.
+unsafe impl Send for TransferCompletion {}
+unsafe impl Sync for TransferCompletion {}
+
+pub(crate) type PendingBulkRead = PendingTransfer<Vec<u8>>;
+pub(crate) type PendingBulkWrite = PendingTransfer<usize>;
+
+pub(crate) struct PendingTransfer<T> {
+    receiver: oneshot::Receiver<io::Result<T>>,
+    completion: Arc<TransferCompletion>,
+    _handle: LibusbDeviceHandle,
+}
+
+impl<T> Future for PendingTransfer<T> {
+    type Output = io::Result<T>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.receiver).poll(cx).map(|result| {
+            result.unwrap_or_else(|_| Err(io::Error::other("USB transfer channel closed")))
+        })
+    }
+}
+
+impl<T> Drop for PendingTransfer<T> {
+    fn drop(&mut self) {
+        let mut transfer = self.completion.transfer.lock().unwrap();
+        if !transfer.is_null() {
+            // Cancellation is asynchronous. Keep the buffer, handle and context
+            // alive until the event thread has run the cancellation callback.
+            unsafe { libusb::libusb_cancel_transfer(*transfer) };
+            while !transfer.is_null() {
+                transfer = self.completion.finished.wait(transfer).unwrap();
+            }
+        }
+    }
 }
 
 struct ControlTransferState {
@@ -606,16 +678,19 @@ extern "system" fn bulk_write_callback(transfer: *mut libusb::libusb_transfer) {
     unsafe {
         let state_ptr = (*transfer).user_data as *mut BulkWriteState;
         let mut state = Box::from_raw(state_ptr);
+        let completion = state.completion.clone();
+        let mut active = completion.transfer.lock().unwrap();
         let result = if (*transfer).status == LIBUSB_TRANSFER_COMPLETED {
             Ok((*transfer).actual_length as usize)
         } else {
             Err(map_transfer_status((*transfer).status))
         };
-        state.buffer.take();
+        libusb::libusb_free_transfer(transfer);
+        *active = ptr::null_mut();
         if let Some(sender) = state.sender.take() {
             let _ = sender.send(result);
         }
-        libusb::libusb_free_transfer(transfer);
+        completion.finished.notify_all();
     }
 }
 
@@ -623,6 +698,8 @@ extern "system" fn bulk_read_callback(transfer: *mut libusb::libusb_transfer) {
     unsafe {
         let state_ptr = (*transfer).user_data as *mut BulkReadState;
         let mut state = Box::from_raw(state_ptr);
+        let completion = state.completion.clone();
+        let mut active = completion.transfer.lock().unwrap();
         let status = (*transfer).status;
         let result = if status == LIBUSB_TRANSFER_COMPLETED {
             if let Some(mut buffer) = state.buffer.take() {
@@ -636,13 +713,14 @@ extern "system" fn bulk_read_callback(transfer: *mut libusb::libusb_transfer) {
                 ))
             }
         } else {
-            eprintln!("[usb] bulk_read_callback error: {:?}", status);
             Err(map_transfer_status(status))
         };
+        libusb::libusb_free_transfer(transfer);
+        *active = ptr::null_mut();
         if let Some(sender) = state.sender.take() {
             let _ = sender.send(result);
         }
-        libusb::libusb_free_transfer(transfer);
+        completion.finished.notify_all();
     }
 }
 
@@ -677,6 +755,8 @@ pub(crate) fn libusb_error_string(code: i32) -> String {
 
 pub(crate) fn map_libusb_error(code: i32) -> io::Error {
     let kind = match code {
+        LIBUSB_ERROR_ACCESS => io::ErrorKind::PermissionDenied,
+        LIBUSB_ERROR_BUSY => io::ErrorKind::AddrInUse,
         LIBUSB_ERROR_TIMEOUT => io::ErrorKind::WouldBlock,
         LIBUSB_ERROR_PIPE => io::ErrorKind::BrokenPipe,
         LIBUSB_ERROR_NO_DEVICE => io::ErrorKind::NotConnected,
@@ -735,4 +815,129 @@ pub(crate) fn read_string_descriptor(handle: &LibusbDeviceHandle, index: u8) -> 
     }
     buf.truncate(len as usize);
     String::from_utf8(buf).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type TestRead = (
+        *mut libusb::libusb_transfer,
+        Arc<TransferCompletion>,
+        oneshot::Receiver<io::Result<Vec<u8>>>,
+    );
+
+    // Exercise the real FFI callback without submitting to a USB device.
+    fn read_completion(status: i32, buffer: Vec<u8>, actual_length: usize) -> TestRead {
+        let transfer = unsafe { libusb::libusb_alloc_transfer(0) };
+        assert!(!transfer.is_null());
+        let completion = Arc::new(TransferCompletion {
+            transfer: Mutex::new(transfer),
+            finished: Condvar::new(),
+        });
+        let (sender, receiver) = oneshot::channel();
+        let state = Box::new(BulkReadState {
+            sender: Some(sender),
+            buffer: Some(buffer),
+            completion: completion.clone(),
+        });
+        unsafe {
+            (*transfer).status = status;
+            (*transfer).actual_length = actual_length as c_int;
+            (*transfer).user_data = Box::into_raw(state).cast();
+        }
+        (transfer, completion, receiver)
+    }
+
+    #[test]
+    fn read_callback_delivers_received_bytes_and_retires_transfer() {
+        let (transfer, completion, receiver) =
+            read_completion(LIBUSB_TRANSFER_COMPLETED, vec![1, 2, 3, 0, 0, 0], 3);
+        bulk_read_callback(transfer);
+        assert_eq!(receiver.blocking_recv().unwrap().unwrap(), vec![1, 2, 3]);
+        assert!(completion.transfer.lock().unwrap().is_null());
+    }
+
+    #[test]
+    fn write_callback_reports_short_writes_errors_and_retires_buffer() {
+        for (status, actual) in [
+            (LIBUSB_TRANSFER_COMPLETED, 20),
+            (LIBUSB_TRANSFER_COMPLETED, 19),
+            (LIBUSB_TRANSFER_CANCELLED, 0),
+            (LIBUSB_TRANSFER_NO_DEVICE, 0),
+            (LIBUSB_TRANSFER_TIMED_OUT, 0),
+        ] {
+            let transfer = unsafe { libusb::libusb_alloc_transfer(0) };
+            assert!(!transfer.is_null());
+            let completion = Arc::new(TransferCompletion {
+                transfer: Mutex::new(transfer),
+                finished: Condvar::new(),
+            });
+            let (sender, receiver) = oneshot::channel();
+            let state = Box::new(BulkWriteState {
+                sender: Some(sender),
+                buffer: Some(vec![0; 20]),
+                completion: completion.clone(),
+            });
+            unsafe {
+                (*transfer).status = status;
+                (*transfer).actual_length = actual;
+                (*transfer).user_data = Box::into_raw(state).cast();
+            }
+            bulk_write_callback(transfer);
+            let result = receiver.blocking_recv().unwrap();
+            if status == LIBUSB_TRANSFER_COMPLETED {
+                assert_eq!(result.unwrap(), actual as usize);
+            } else {
+                assert_eq!(
+                    result.unwrap_err().kind(),
+                    map_transfer_status(status).kind()
+                );
+            }
+            assert!(completion.transfer.lock().unwrap().is_null());
+        }
+    }
+
+    #[test]
+    fn error_callbacks_wake_cancellation_waiters() {
+        for (status, kind) in [
+            (LIBUSB_TRANSFER_CANCELLED, io::ErrorKind::Interrupted),
+            (LIBUSB_TRANSFER_NO_DEVICE, io::ErrorKind::NotConnected),
+        ] {
+            let (transfer, completion, receiver) = read_completion(status, vec![0; 64], 0);
+            let waiting = completion.clone();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                let mut active = waiting.transfer.lock().unwrap();
+                started_tx.send(()).unwrap();
+                while !active.is_null() {
+                    active = waiting.finished.wait(active).unwrap();
+                }
+                done_tx.send(()).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            bulk_read_callback(transfer);
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("cancellation waiter was not woken");
+            waiter.join().unwrap();
+            assert_eq!(receiver.blocking_recv().unwrap().unwrap_err().kind(), kind);
+            assert!(completion.transfer.lock().unwrap().is_null());
+        }
+    }
+
+    #[test]
+    fn idle_event_thread_can_be_stopped() {
+        let context = LibusbContext::new().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            drop(context);
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("event thread failed to stop");
+        worker.join().unwrap();
+    }
 }

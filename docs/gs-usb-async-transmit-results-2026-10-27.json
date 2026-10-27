@@ -1,0 +1,257 @@
+{
+  "date": "2026-10-27",
+  "logical_processors": 8,
+  "implementation": "Up to 10 eager, ordered async USB OUT transfers; release credit only on USB completion AND firmware echo; control commands drain earlier writes; pending transfers cancel and retire on drop.",
+  "builds": {
+    "canserver_sha256": "cdbb16a2714eda367c6a03ab8b105a4350f52c16b4e4de32d54f321f7466162b",
+    "load_example_sha256": "1ba320116e8c7c6e76f46da09345fc5e0a2c2df63b2d36bc36efb31ad6d48e81"
+  },
+  "adapters_at_load_test": {
+    "loadA": {
+      "product": "SH-C31x (SH-C31A)",
+      "serial": "0021002D3133500F20313355",
+      "firmware_revision": "0215 (DSD TECH v1.5)",
+      "backend": "WinUSB"
+    },
+    "loadB": {
+      "product": "canable gs_usb",
+      "serial": "002F00165046570120333836",
+      "firmware_revision": "0000",
+      "backend": "WinUSB"
+    }
+  },
+  "notes": [
+    "All sustained load tests completed before the SH-C31A was flashed with Cyder firmware.",
+    "Each direction submitted continuously for 60 seconds, then drained pending frames.",
+    "Bus usage is an estimate from 111 to 135 bits per frame including intermission, capped at 100%.",
+    "Classic CAN only; sequential directions. CAN FD and simultaneous bidirectional load were not tested."
+  ],
+  "automated_tests": {
+    "passed": 25
+  },
+  "hardware_lifecycle": {
+    "passed": true,
+    "cycles": 6,
+    "test": "tests/gsusb_hardware.rs: queued_transmit_close_drop_and_reopen"
+  },
+  "runs": [
+    {
+      "label": "async-sustained-1M",
+      "results": [
+        {
+          "bad_payloads": 0,
+          "bitrate": 1000000,
+          "bus_load_max_percent": 69.59692463158953,
+          "bus_load_min_percent": 57.22413803041806,
+          "destination": "loadB",
+          "duplicates": 0,
+          "error_frames": 0,
+          "missing": 0,
+          "missing_sample": [],
+          "other_frames": 0,
+          "out_of_order": 0,
+          "read_error": null,
+          "receive_seconds": 60.8405547,
+          "received": 313654,
+          "received_fps": 5155.327750488113,
+          "requested_fps": 0,
+          "send_seconds": 60.0362349,
+          "source": "loadA",
+          "submitted": 313654,
+          "success": true,
+          "timestamp_regressions": 0,
+          "timestamped": 313654,
+          "write_error": null,
+          "exit_code": 0,
+          "stderr": "",
+          "measured_seconds": 61.37436469999375,
+          "devices": {
+            "loadA": "0021002D3133500F20313355/0",
+            "loadB": "002F00165046570120333836/0"
+          },
+          "server_cpu": [
+            {
+              "name": "loadA",
+              "cpu_seconds": 20.171875,
+              "percent_one_core": 32.86693898764227,
+              "percent_machine": 4.108367373455284
+            },
+            {
+              "name": "loadB",
+              "cpu_seconds": 11.125,
+              "percent_one_core": 18.126460541596668,
+              "percent_machine": 2.2658075676995835
+            }
+          ],
+          "previous_sync_received_fps": 4576.996330643759,
+          "change_percent": 12.635610301287059
+        },
+        {
+          "bad_payloads": 0,
+          "bitrate": 1000000,
+          "bus_load_max_percent": 100.0,
+          "bus_load_min_percent": 92.29498692114718,
+          "destination": "loadA",
+          "duplicates": 0,
+          "error_frames": 0,
+          "missing": 0,
+          "missing_sample": [],
+          "other_frames": 0,
+          "out_of_order": 0,
+          "read_error": null,
+          "receive_seconds": 60.5012925,
+          "received": 503061,
+          "received_fps": 8314.863686589837,
+          "requested_fps": 0,
+          "send_seconds": 60.0063268,
+          "source": "loadB",
+          "submitted": 503061,
+          "success": true,
+          "timestamp_regressions": 0,
+          "timestamped": 503061,
+          "write_error": null,
+          "exit_code": 0,
+          "stderr": "",
+          "measured_seconds": 61.04319909999322,
+          "devices": {
+            "loadA": "0021002D3133500F20313355/0",
+            "loadB": "002F00165046570120333836/0"
+          },
+          "server_cpu": [
+            {
+              "name": "loadA",
+              "cpu_seconds": 18.0625,
+              "percent_one_core": 29.589700845154436,
+              "percent_machine": 3.6987126056443045
+            },
+            {
+              "name": "loadB",
+              "cpu_seconds": 34.171875,
+              "percent_one_core": 55.97982331172384,
+              "percent_machine": 6.99747791396548
+            }
+          ],
+          "previous_sync_received_fps": 7107.919379502722,
+          "change_percent": 16.980275698787594
+        }
+      ],
+      "server_error_logs": {
+        "loadA": "",
+        "loadB": ""
+      }
+    },
+    {
+      "label": "async-sustained-125k",
+      "results": [
+        {
+          "bad_payloads": 0,
+          "bitrate": 125000,
+          "bus_load_max_percent": 100.0,
+          "bus_load_min_percent": 92.48271890293162,
+          "destination": "loadB",
+          "duplicates": 0,
+          "error_frames": 0,
+          "missing": 0,
+          "missing_sample": [],
+          "other_frames": 0,
+          "out_of_order": 0,
+          "read_error": null,
+          "receive_seconds": 64.2379211,
+          "received": 66903,
+          "received_fps": 1041.4720597176986,
+          "requested_fps": 0,
+          "send_seconds": 60.1824854,
+          "source": "loadA",
+          "submitted": 66903,
+          "success": true,
+          "timestamp_regressions": 0,
+          "timestamped": 66903,
+          "write_error": null,
+          "exit_code": 0,
+          "stderr": "",
+          "measured_seconds": 64.85177690000273,
+          "devices": {
+            "loadA": "0021002D3133500F20313355/0",
+            "loadB": "002F00165046570120333836/0"
+          },
+          "server_cpu": [
+            {
+              "name": "loadA",
+              "cpu_seconds": 7.71875,
+              "percent_one_core": 11.902141111571725,
+              "percent_machine": 1.4877676389464656
+            },
+            {
+              "name": "loadB",
+              "cpu_seconds": 4.015625,
+              "percent_one_core": 6.19200458638448,
+              "percent_machine": 0.77400057329806
+            }
+          ]
+        },
+        {
+          "bad_payloads": 0,
+          "bitrate": 125000,
+          "bus_load_max_percent": 100.0,
+          "bus_load_min_percent": 91.75454656960268,
+          "destination": "loadA",
+          "duplicates": 0,
+          "error_frames": 0,
+          "missing": 0,
+          "missing_sample": [],
+          "other_frames": 0,
+          "out_of_order": 0,
+          "read_error": null,
+          "receive_seconds": 64.2502701,
+          "received": 66389,
+          "received_fps": 1033.271920828859,
+          "requested_fps": 0,
+          "send_seconds": 60.1627249,
+          "source": "loadB",
+          "submitted": 66389,
+          "success": true,
+          "timestamp_regressions": 0,
+          "timestamped": 66389,
+          "write_error": null,
+          "exit_code": 0,
+          "stderr": "",
+          "measured_seconds": 64.8397152999969,
+          "devices": {
+            "loadA": "0021002D3133500F20313355/0",
+            "loadB": "002F00165046570120333836/0"
+          },
+          "server_cpu": [
+            {
+              "name": "loadA",
+              "cpu_seconds": 3.984375,
+              "percent_one_core": 6.144960664255401,
+              "percent_machine": 0.7681200830319251
+            },
+            {
+              "name": "loadB",
+              "cpu_seconds": 6.5625,
+              "percent_one_core": 10.121111682303013,
+              "percent_machine": 1.2651389602878766
+            }
+          ]
+        }
+      ],
+      "server_error_logs": {
+        "loadA": "",
+        "loadB": ""
+      }
+    }
+  ],
+  "total_frames": 950007,
+  "post_flash_idle": {
+    "adapter": "Cyder CANable gs_usb",
+    "serial": "205233823133",
+    "bitrate": 1000000,
+    "cpu_seconds": 0.0,
+    "wall_seconds": 10.001008399995044,
+    "percent_one_core": 0.0,
+    "stayed_running": true,
+    "traffic": "Idle; no CAN frames sent",
+    "forced_stop": true
+  }
+}

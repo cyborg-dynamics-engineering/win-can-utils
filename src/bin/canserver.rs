@@ -2,6 +2,7 @@ use bincode;
 use clap::Parser;
 use crosscan::can::CanFrame;
 use serialport::available_ports;
+use std::io::IsTerminal;
 use std::path::Path;
 use std::process::exit;
 use std::sync::Arc;
@@ -9,25 +10,37 @@ use tokio::signal;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
+use win_can_utils::instance_lock::InstanceLock;
 use win_can_utils::{CanDriver, GsUsbDriver, PcanDriver, SlcanDriver, thread_manager_async};
 
-/// Determine the next available IPC channel name by probing for an unused pipe.
-///
-/// The IPC implementation uses Windows named pipes whose names are derived from the
-/// channel.  We iterate a numeric suffix until we find a pipe that does not exist
-/// yet and return the corresponding channel identifier.
-fn next_auto_channel(base: &str) -> String {
+#[path = "canserver/adapters.rs"]
+mod adapters;
+
+/// Reserve an IPC name for this process. A kernel reservation prevents concurrent
+/// starts from choosing the same name; pipe checks also detect older servers.
+fn reserve_channel(requested: Option<&str>, base: &str) -> std::io::Result<(String, InstanceLock)> {
+    if let Some(name) = requested.filter(|name| !name.eq_ignore_ascii_case("auto")) {
+        let reservation = InstanceLock::acquire("pipe", name)?;
+        if Path::new(&format!(r"\\.\pipe\can_{name}_in")).exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!("CAN pipe {name} already exists"),
+            ));
+        }
+        return Ok((name.into(), reservation));
+    }
     let mut idx = 0;
     loop {
         let candidate = format!("{}{}", base, idx);
-        let path = &format!(r"\\.\pipe\can_{}_in", candidate);
-
-        let pipe_path = Path::new(path);
-
-        if !pipe_path.exists() {
-            return candidate;
+        match InstanceLock::acquire("pipe", &candidate) {
+            Ok(reservation) => {
+                if !Path::new(&format!(r"\\.\pipe\can_{candidate}_in")).exists() {
+                    return Ok((candidate, reservation));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(error) => return Err(error),
         }
-
         idx += 1;
     }
 }
@@ -36,9 +49,18 @@ fn next_auto_channel(base: &str) -> String {
 struct Cli {
     /// Supported drivers: gsusb, pcan, slcan
     driver: String,
-    /// Channel: use auto for auto-detect
+    /// Driver channel or legacy gs_usb adapter selector; auto detects/selects
     #[arg(short = 'c', long = "channel", default_value = "auto")]
     channel: String,
+    /// gs_usb adapter ID (bus:address/interface), serial number, or product name
+    #[arg(long, conflicts_with = "channel")]
+    device: Option<String>,
+    /// IPC name, e.g. can0; defaults to the next free canN with --device or auto
+    #[arg(long)]
+    name: Option<String>,
+    /// List connected gs_usb adapters, including unavailable ones, and exit
+    #[arg(long, alias = "list")]
+    list_adapters: bool,
     #[arg(short = 'b', long = "bitrate")]
     bitrate: Option<u32>,
 }
@@ -216,16 +238,33 @@ async fn init_slcan(cli: &Cli) -> std::io::Result<Box<dyn CanDriver>> {
 }
 
 async fn init_gsusb(cli: &Cli) -> std::io::Result<Box<dyn CanDriver>> {
-    let mut driver = GsUsbDriver::open(&cli.channel).await?;
-
-    driver.close_channel().await?;
-
     let bitrate = cli.bitrate.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::Other,
             "No bitrate provided. Specify one with -b <bitrate> for gs_usb devices.",
         )
     })?;
+
+    let requested = cli.device.as_deref().unwrap_or(&cli.channel);
+    let identifier = if requested.eq_ignore_ascii_case("auto") {
+        tokio::task::spawn_blocking(|| {
+            let connected = GsUsbDriver::list_adapters()?;
+            adapters::select_adapter(
+                &connected,
+                std::io::stdin().is_terminal(),
+                &mut std::io::stdin().lock(),
+                &mut std::io::stdout().lock(),
+            )
+        })
+        .await
+        .map_err(std::io::Error::other)??
+    } else {
+        requested.to_owned()
+    };
+    // Availability can change after the menu; open the chosen ID again and
+    // report a race instead of silently substituting a different adapter.
+    let mut driver = GsUsbDriver::open(&identifier).await?;
+    driver.close_channel().await?;
 
     println!("gs_usb connected to {}", driver.device_label());
 
@@ -259,9 +298,9 @@ async fn initialize_driver(cli: &Cli) -> std::io::Result<Box<dyn CanDriver>> {
 fn spawn_ipc_tasks(
     channel_name: String,
     driver: Arc<Mutex<Box<dyn CanDriver>>>,
-) -> std::io::Result<(mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>)> {
+) -> std::io::Result<(mpsc::Sender<Vec<u8>>, mpsc::Receiver<CanFrame>)> {
     let (tx_out_pipe, rx_out_pipe) = mpsc::channel::<Vec<u8>>(100);
-    let (tx_in_pipe, rx_in_pipe) = mpsc::channel::<Vec<u8>>(100);
+    let (tx_in_pipe, rx_in_pipe) = mpsc::channel::<CanFrame>(100);
 
     tokio::spawn(thread_manager_async::start_ipc_reader(
         channel_name.clone(),
@@ -288,29 +327,38 @@ fn spawn_ipc_tasks(
 
 /// Consume CAN frames received from the IPC pipe and forward them to the driver.
 async fn forward_pipe_to_can(
-    mut rx_in_pipe: mpsc::Receiver<Vec<u8>>,
+    mut rx_in_pipe: mpsc::Receiver<CanFrame>,
     driver: Arc<Mutex<Box<dyn CanDriver>>>,
 ) {
-    while let Some(line) = rx_in_pipe.recv().await {
-        if let Ok((frame, _)) =
-            bincode::serde::decode_from_slice::<CanFrame, _>(&line, bincode::config::standard())
-        {
-            let mut d = driver.lock().await;
-            if let Err(e) = d.send_frame(&frame).await {
-                eprintln!("Failed to send CAN frame: {:?}", e);
-            }
+    while let Some(frame) = rx_in_pipe.recv().await {
+        let mut d = driver.lock().await;
+        if let Err(e) = d.send_frame(&frame).await {
+            eprintln!("Failed to send CAN frame: {:?}", e);
         }
     }
 }
 
-/// Continuously poll the CAN driver and push any frames to the IPC writer.
+/// Forward CAN frames, waiting outside the driver lock when RX can signal readiness.
 async fn forward_can_to_pipe(
     driver: Arc<Mutex<Box<dyn CanDriver>>>,
     tx_out_pipe: mpsc::Sender<Vec<u8>>,
 ) {
+    let receive_notifier = driver.lock().await.receive_notifier();
     loop {
-        match driver.lock().await.read_frames().await {
+        let result = {
+            let mut driver = driver.lock().await;
+            driver.read_frames().await
+        };
+        match result {
             Ok(frames) => {
+                if frames.is_empty() {
+                    if let Some(notifier) = &receive_notifier {
+                        notifier.notified().await;
+                    } else {
+                        tokio::task::yield_now().await;
+                    }
+                    continue;
+                }
                 for frame in frames {
                     if let Ok(mut data) =
                         bincode::serde::encode_to_vec(frame, bincode::config::standard())
@@ -321,7 +369,12 @@ async fn forward_can_to_pipe(
                         }
                         let mut msg = vec![data.len() as u8];
                         msg.append(&mut data);
-                        let _ = tx_out_pipe.try_send(msg);
+                        // Preserve bursts when the bounded pipe queue is full.
+                        // The driver lock has already been released, so TX is
+                        // still available while the pipe applies backpressure.
+                        if tx_out_pipe.send(msg).await.is_err() {
+                            return;
+                        }
                     }
                 }
             }
@@ -338,11 +391,23 @@ async fn main() -> std::io::Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 
-    let channel_name = if cli.channel.to_ascii_lowercase() == "auto" {
-        next_auto_channel("can")
-    } else {
-        cli.channel.clone()
-    };
+    let is_gsusb = matches!(cli.driver.to_ascii_lowercase().as_str(), "gsusb" | "gs_usb");
+    if !is_gsusb && (cli.device.is_some() || cli.list_adapters) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--device and --list-adapters currently apply to gsusb.",
+        ));
+    }
+    if cli.list_adapters {
+        return adapters::print_adapters(
+            &GsUsbDriver::list_adapters()?,
+            &mut std::io::stdout().lock(),
+        );
+    }
+    let legacy_name = (cli.device.is_none() && !cli.channel.eq_ignore_ascii_case("auto"))
+        .then_some(cli.channel.as_str());
+    let (channel_name, _channel_reservation) =
+        reserve_channel(cli.name.as_deref().or(legacy_name), "can")?;
 
     // Initialize the requested CAN driver implementation.
     let driver = match initialize_driver(&cli).await {
@@ -397,4 +462,174 @@ async fn main() -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::collections::VecDeque;
+    use std::io;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+    use tokio::time::{sleep, timeout};
+
+    #[derive(Default)]
+    struct TestState {
+        frames: StdMutex<VecDeque<CanFrame>>,
+        sent: StdMutex<Vec<CanFrame>>,
+        reads: AtomicUsize,
+        ready: Arc<Notify>,
+        read_started: Notify,
+    }
+
+    struct TestDriver {
+        state: Arc<TestState>,
+        // Enqueue during an empty read to exercise the read/wait race.
+        frame_during_read: Option<CanFrame>,
+    }
+
+    #[async_trait]
+    impl CanDriver for TestDriver {
+        async fn enable_timestamp(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        async fn set_bitrate(&mut self, _: u32) -> io::Result<()> {
+            Ok(())
+        }
+        async fn get_bitrate(&self) -> Option<u32> {
+            Some(1_000_000)
+        }
+        async fn open_channel(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        async fn close_channel(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn send_frame(&mut self, frame: &CanFrame) -> io::Result<()> {
+            self.state.sent.lock().unwrap().push(frame.clone());
+            Ok(())
+        }
+
+        async fn read_frames(&mut self) -> io::Result<Vec<CanFrame>> {
+            self.state.reads.fetch_add(1, Ordering::SeqCst);
+            self.state.read_started.notify_one();
+            let mut queue = self.state.frames.lock().unwrap();
+            let count = queue.len().min(1024);
+            let frames: Vec<_> = queue.drain(..count).collect();
+            match (frames.is_empty(), self.frame_during_read.take()) {
+                (true, Some(frame)) => {
+                    queue.push_back(frame);
+                    self.state.ready.notify_one();
+                }
+                (_, frame) => self.frame_during_read = frame,
+            }
+            Ok(frames)
+        }
+
+        fn receive_notifier(&self) -> Option<Arc<Notify>> {
+            Some(self.state.ready.clone())
+        }
+    }
+
+    fn test_driver(
+        state: &Arc<TestState>,
+        frame_during_read: Option<CanFrame>,
+    ) -> Arc<Mutex<Box<dyn CanDriver>>> {
+        Arc::new(Mutex::new(Box::new(TestDriver {
+            state: state.clone(),
+            frame_during_read,
+        })))
+    }
+
+    async fn next_frame(rx: &mut mpsc::Receiver<Vec<u8>>) -> CanFrame {
+        let msg = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("frame forwarding stalled")
+            .expect("forwarder closed");
+        assert_eq!(usize::from(msg[0]), msg.len() - 1);
+        let (frame, used) = bincode::serde::decode_from_slice::<CanFrame, _>(
+            &msg[1..],
+            bincode::config::standard(),
+        )
+        .unwrap();
+        assert_eq!(used, msg.len() - 1);
+        frame
+    }
+
+    #[tokio::test]
+    async fn idle_rx_waits_without_polling_or_blocking_tx() {
+        let state = Arc::new(TestState::default());
+        let driver = test_driver(&state, None);
+        let (tx, mut rx) = mpsc::channel(1);
+        let forwarder = tokio::spawn(forward_can_to_pipe(driver.clone(), tx));
+        timeout(Duration::from_secs(2), state.read_started.notified())
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(30)).await;
+        assert_eq!(state.reads.load(Ordering::SeqCst), 1, "idle RX is polling");
+
+        let frame = CanFrame::new(0x123, &[1, 2, 3]).unwrap();
+        timeout(Duration::from_secs(2), async {
+            driver.lock().await.send_frame(&frame).await.unwrap();
+        })
+        .await
+        .expect("idle RX held the driver lock");
+        assert_eq!(*state.sent.lock().unwrap(), vec![frame.clone()]);
+
+        state.frames.lock().unwrap().push_back(frame.clone());
+        state.ready.notify_one();
+        assert_eq!(next_frame(&mut rx).await, frame);
+        forwarder.abort();
+        let _ = forwarder.await;
+    }
+
+    #[tokio::test]
+    async fn notification_between_empty_read_and_wait_is_retained() {
+        let state = Arc::new(TestState::default());
+        let frame = CanFrame::new_remote(0x321, 8, false).unwrap();
+        let driver = test_driver(&state, Some(frame.clone()));
+        let (tx, mut rx) = mpsc::channel(1);
+        let forwarder = tokio::spawn(forward_can_to_pipe(driver, tx));
+        assert_eq!(next_frame(&mut rx).await, frame);
+        forwarder.abort();
+        let _ = forwarder.await;
+    }
+
+    #[tokio::test]
+    async fn full_pipe_queue_preserves_burst_order_and_allows_tx() {
+        let state = Arc::new(TestState::default());
+        let expected: Vec<_> = (0..4096u32)
+            .map(|seq| {
+                let mut frame = CanFrame::new_eff(0x12345, &seq.to_le_bytes()).unwrap();
+                frame.set_timestamp(Some((1u64 << 32) - 2048 + u64::from(seq)));
+                frame
+            })
+            .collect();
+        state
+            .frames
+            .lock()
+            .unwrap()
+            .extend(expected.iter().cloned());
+        let driver = test_driver(&state, None);
+        // One queued frame forces backpressure on the very next frame.
+        let (tx, mut rx) = mpsc::channel(1);
+        let forwarder = tokio::spawn(forward_can_to_pipe(driver.clone(), tx));
+        timeout(Duration::from_secs(2), state.read_started.notified())
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), async {
+            driver.lock().await.send_frame(&expected[0]).await.unwrap();
+        })
+        .await
+        .expect("pipe backpressure held the driver lock");
+        for frame in expected {
+            assert_eq!(next_frame(&mut rx).await, frame);
+        }
+        assert!(rx.try_recv().is_err(), "duplicate frames");
+        forwarder.abort();
+        let _ = forwarder.await;
+    }
 }
